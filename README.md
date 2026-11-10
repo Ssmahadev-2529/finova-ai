@@ -1,13 +1,17 @@
 # Finova AI — AI-Powered Financial Intelligence & Payment Security Platform
 
 [![PayPal Sandbox](https://img.shields.io/badge/PayPal-Sandbox_API_v2-003087?style=flat&logo=paypal)](https://developer.paypal.com/)
+[![Live Frontend](https://img.shields.io/badge/Live_App-Vercel-000000?style=flat&logo=vercel)](https://finova-ai-dun.vercel.app)
 [![FastAPI](https://img.shields.io/badge/Backend-FastAPI_0.115-009688?style=flat&logo=fastapi)](https://fastapi.tiangolo.com/)
 [![React](https://img.shields.io/badge/Frontend-React_18_TypeScript-61DAFB?style=flat&logo=react)](https://react.dev/)
 [![Gemini](https://img.shields.io/badge/AI-Google_Gemini_1.5_Flash-4285F4?style=flat&logo=google)](https://ai.google.dev/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/Tests-72_Passing-success)](backend/)
+[![Tests](https://img.shields.io/badge/Tests-110_Backend_%2B_7_Frontend_Passing-success)](backend/)
 
 Finova AI is a production-grade financial intelligence, transaction cost optimization, and anti-fraud platform integrated with the **PayPal Developer Sandbox REST API v2**. Built for high-volume merchants, platforms, and fintech developers, Finova AI adds an autonomous AI intelligence layer that turns opaque payment records into actionable fee optimizations, real-time threat neutralization, anomaly detection, and accurate revenue forecasting.
+
+> **Live Frontend Deployment (Vercel):** [https://finova-ai-dun.vercel.app](https://finova-ai-dun.vercel.app)  
+> *Note: Live backend hosting (FastAPI + PostgreSQL + Redis via [`render.yaml`](./render.yaml)) is configured per [`docs/STAGING_DEPLOYMENT_GUIDE.md`](./docs/STAGING_DEPLOYMENT_GUIDE.md); set `VITE_API_BASE_URL` on Vercel when connecting a cloud API host.*
 
 ---
 
