@@ -13,6 +13,7 @@ from database import engine, SessionLocal, initialize_database, verify_database_
 from config import settings, Settings
 import models.user
 import models.transaction
+import models.finance
 from contextlib import asynccontextmanager
 from routes.auth_routes import router as auth_router
 from routes.paypal_routes import router as paypal_router
@@ -213,10 +214,15 @@ class RateLimitingMiddleware:
             or path.startswith("/api/v1/auth/register")
             or path.startswith("/api/v1/auth/forgot-password")
             or path.startswith("/api/v1/auth/reset-password")
+            or path.startswith("/api/v1/auth/change-password")
         ):
             bucket = "auth"
             limit = settings.RATE_LIMIT_AUTH_PER_MINUTE
             limit_msg = "Too many authentication requests. Please try again in 1 minute."
+        elif path.startswith("/api/v1/paypal/webhooks"):
+            bucket = "webhook"
+            limit = 600
+            limit_msg = "Webhook burst rate limit reached."
         elif path.startswith("/api/v1/"):
             bucket = "api"
             limit = settings.RATE_LIMIT_API_PER_MINUTE
@@ -322,7 +328,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "Accept", "Origin", "X-Requested-With", "PayPal-Request-Id"],
 )
 

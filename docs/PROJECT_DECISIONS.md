@@ -34,3 +34,4 @@
 - **Context:** `GET /api/v1/transactions` returns a flat JSON array (`list[dict]`) consumed by existing frontend callers and 101 backend tests. Removing that contract would break existing tests and UI callers.
 - **Decision:** Preserve `GET /api/v1/transactions` returning `list[dict]` by default with optional `search`, `status`, `risk`, `source`, `category`, `txn_type`, `date_from`, `date_to`, `min_amount`, `max_amount`, `sort_by`, `sort_dir`, `limit`, and `offset` parameters (and `X-Total-Count` response header plus an optional `GET /api/v1/transactions/paged` envelope if needed by UI pagination), while adding `vitest` + `@testing-library/react` + `jsdom` to `frontend/` for genuine component/integration tests.
 - **Consequences:** 100% backward compatibility with all existing automated backend tests alongside real pagination, filtering, sorting, and frontend test coverage.
+

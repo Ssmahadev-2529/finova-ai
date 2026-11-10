@@ -100,3 +100,4 @@ flowchart LR
   - `categories` (`id`, `user_id`, `name`, `kind`, `color`, `created_at`)
   - `budgets` (`id`, `user_id`, `category`, `limit_amount Numeric(12,2)`, `currency`, `period`, `created_at`, `updated_at`)
   - `ai_usage_logs` (`id`, `user_id`, `intent`, `provider`, `model_name`, `latency_ms`, `prompt_chars`, `response_chars`, `used_fallback`, `created_at`)
+

@@ -1,3 +1,4 @@
+import logging
 import os
 os.environ["LOKY_MAX_CPU_COUNT"] = "1"
 import numpy as np
@@ -5,6 +6,10 @@ from datetime import datetime
 from typing import List, Dict, Any, Tuple, Optional
 from sklearn.ensemble import IsolationForest
 from sklearn.neighbors import LocalOutlierFactor
+from services.shared_utils import convert_to_usd, is_cross_border, parse_transaction_datetime
+
+logger = logging.getLogger("finova.anomaly")
+MODEL_VERSION = "finova-if-lof-v1.1"
 
 class AnomalyService:
     """
@@ -26,12 +31,18 @@ class AnomalyService:
     """
 
     def __init__(self):
-        # Isolation Forest with 5% contamination assumption
-        self.isolation_forest = IsolationForest(
-            n_estimators=50,
-            contamination=0.08,
-            random_state=42,
-            n_jobs=1
+        self.model_version = MODEL_VERSION
+        self.n_estimators = 100
+        self.contamination = 0.08
+        self.random_state = 42
+
+    def _build_isolation_forest(self) -> IsolationForest:
+        """Creates a fresh thread-safe estimator per evaluation request."""
+        return IsolationForest(
+            n_estimators=self.n_estimators,
+            contamination=self.contamination,
+            random_state=self.random_state,
+            n_jobs=1,
         )
 
     def analyze_transaction(
@@ -118,12 +129,12 @@ class AnomalyService:
             }
 
         total = len(transactions)
-        amounts = [float(t.get("amount", 0.0)) for t in transactions]
-        total_volume = round(float(sum(amounts)), 2)
-        avg_amount = round(float(np.mean(amounts)), 2)
-        median_amount = round(float(np.median(amounts)), 2)
-        std_amount = round(float(np.std(amounts)), 2)
-        max_amount = round(float(max(amounts)), 2)
+        usd_amounts = [float(convert_to_usd(t.get("amount", 0.0), t.get("currency", "USD"))) for t in transactions]
+        total_volume = round(float(sum(usd_amounts)), 2)
+        avg_amount = round(float(np.mean(usd_amounts)), 2)
+        median_amount = round(float(np.median(usd_amounts)), 2)
+        std_amount = round(float(np.std(usd_amounts)), 2)
+        max_amount = round(float(max(usd_amounts)), 2)
 
         # Status breakdowns
         completed = sum(1 for t in transactions if str(t.get("status", "")).upper() == "COMPLETED")
@@ -143,8 +154,7 @@ class AnomalyService:
         for t in transactions:
             curr = str(t.get("currency", "USD")).upper()
             currency_counts[curr] = currency_counts.get(curr, 0) + 1
-            country = str(t.get("country", "")).lower()
-            if country and country not in ["united states", "usa", "us"]:
+            if is_cross_border(t.get("country")):
                 cross_border_count += 1
 
         international_ratio = round((cross_border_count / total) * 100, 2)
@@ -154,12 +164,7 @@ class AnomalyService:
         for t in transactions:
             d_str = t.get("date") or t.get("createdAt")
             if d_str:
-                try:
-                    # supports "2026-11-04 14:24" or ISO string
-                    dt = datetime.fromisoformat(d_str.replace(" ", "T"))
-                    dates.append(dt)
-                except Exception:
-                    pass
+                dates.append(parse_transaction_datetime(d_str))
 
         velocity_per_day = round(total / 7.0, 1) # Default 7-day window
         volume_volatility = 0.0
@@ -169,10 +174,20 @@ class AnomalyService:
             span_days = max(1.0, (dates[-1] - dates[0]).total_seconds() / 86400.0)
             velocity_per_day = round(total / span_days, 1)
 
-            # Volatility: compare recent half vs older half
+            # Volatility: sort chronologically ascending so older vs recent half is order-independent
+            paired = sorted(
+                zip(
+                    [
+                        parse_transaction_datetime(str(t.get("date") or t.get("createdAt") or ""))
+                        for t in transactions
+                    ],
+                    usd_amounts,
+                ),
+                key=lambda item: item[0],
+            )
             mid_idx = total // 2
-            older_vol = sum(amounts[mid_idx:]) if amounts[mid_idx:] else 1.0
-            recent_vol = sum(amounts[:mid_idx]) if amounts[:mid_idx] else 1.0
+            older_vol = sum(val for _, val in paired[:mid_idx]) if mid_idx > 0 else 1.0
+            recent_vol = sum(val for _, val in paired[mid_idx:]) if mid_idx < total else 1.0
             ratio = (recent_vol / max(1.0, older_vol))
             volume_volatility = round((ratio - 1.0) * 100, 1)
 
@@ -209,31 +224,31 @@ class AnomalyService:
 
         anomalies = []
         n = len(transactions)
-        amounts = [float(t.get("amount", 0.0)) for t in transactions]
-        mean_amt = float(np.mean(amounts)) if amounts else 0.0
-        std_amt = float(np.std(amounts)) if len(amounts) > 1 else 0.0
+        usd_amounts = [float(convert_to_usd(t.get("amount", 0.0), t.get("currency", "USD"))) for t in transactions]
+        mean_amt = float(np.mean(usd_amounts)) if usd_amounts else 0.0
+        std_amt = float(np.std(usd_amounts)) if len(usd_amounts) > 1 else 0.0
 
         if n >= 10:
             try:
-                # Multi-feature vector: [amount, is_international, is_denied, is_refund, amount_zscore, is_disputed]
+                # Multi-feature vector: [usd_amount, is_international, is_denied, is_refund, amount_zscore, is_disputed]
                 feature_matrix = []
-                for t in transactions:
-                    amt = float(t.get("amount", 0.0))
-                    country = str(t.get("country", "")).lower()
-                    is_intl = 1.0 if (country and country not in ["united states", "usa", "us"]) else 0.0
+                for idx_t, t in enumerate(transactions):
+                    amt_usd = usd_amounts[idx_t]
+                    is_intl = 1.0 if is_cross_border(t.get("country")) else 0.0
                     status = str(t.get("status", "")).upper()
                     is_denied = 1.0 if status in ["DENIED", "FAILED"] else 0.0
                     is_refund = 1.0 if status == "REFUNDED" else 0.0
                     is_disputed = 1.0 if status == "DISPUTED" else 0.0
-                    zscore = (amt - mean_amt) / max(1.0, std_amt)
-                    feature_matrix.append([amt, is_intl, is_denied, is_refund, zscore, is_disputed])
+                    zscore = (amt_usd - mean_amt) / max(1.0, std_amt)
+                    feature_matrix.append([amt_usd, is_intl, is_denied, is_refund, zscore, is_disputed])
 
                 X = np.array(feature_matrix)
 
-                # Fit Isolation Forest
-                self.isolation_forest.fit(X)
-                if_preds = self.isolation_forest.predict(X) # -1 for outliers, 1 for inliers
-                if_scores = self.isolation_forest.score_samples(X)
+                # Fit per-evaluation Isolation Forest cleanly (thread-safe across tenants)
+                iso_forest = self._build_isolation_forest()
+                iso_forest.fit(X)
+                if_preds = iso_forest.predict(X) # -1 for outliers, 1 for inliers
+                if_scores = iso_forest.score_samples(X)
 
                 # Fit Local Outlier Factor
                 lof = LocalOutlierFactor(n_neighbors=min(5, n - 1), contamination=0.08, n_jobs=1)
@@ -249,10 +264,11 @@ class AnomalyService:
                     db_reason = t.get("anomalyReason") or t.get("anomaly_reason")
 
                     if is_if_outlier or is_lof_outlier or db_anomaly:
-                        amt = float(t.get("amount", 0.0))
+                        raw_amt = float(t.get("amount", 0.0))
+                        amt_usd = usd_amounts[idx]
                         triggers = []
-                        if amt > (mean_amt + 2.5 * std_amt) or amt > 3000.0:
-                            triggers.append(f"Amount (${amt:,.2f}) exceeds statistical 2.5σ baseline (${mean_amt:,.2f})")
+                        if amt_usd > (mean_amt + 2.5 * std_amt) or amt_usd > 3000.0:
+                            triggers.append(f"Amount (${amt_usd:,.2f} USD eq.) exceeds statistical 2.5σ baseline (${mean_amt:,.2f})")
                         if is_if_outlier:
                             triggers.append(f"Isolation Forest identified feature outlier (Score: {score_val})")
                         if is_lof_outlier:
@@ -272,7 +288,7 @@ class AnomalyService:
                             "transactionId": t.get("id"),
                             "date": t.get("date") or t.get("createdAt") or "Recent",
                             "customerName": t.get("customerName") or t.get("customer_name") or "Merchant Customer",
-                            "amount": amt,
+                            "amount": raw_amt,
                             "currency": t.get("currency", "USD"),
                             "status": status,
                             "riskScore": risk_score,
@@ -281,24 +297,24 @@ class AnomalyService:
                             "isolationScore": score_val
                         })
                 return anomalies
-            except Exception:
-                # Fallback to statistical detection if ML fails
-                pass
+            except Exception as exc:
+                logger.warning("ML anomaly detection fallback engaged (%s)", type(exc).__name__)
 
         # Fallback: Deterministic statistical anomaly detection (for small N or on ML error)
         for idx, t in enumerate(transactions):
-            amt = float(t.get("amount", 0.0))
+            raw_amt = float(t.get("amount", 0.0))
+            amt_usd = usd_amounts[idx]
             status = str(t.get("status", "")).upper()
             db_anomaly = bool(t.get("isAnomaly") or t.get("is_anomaly"))
             db_reason = t.get("anomalyReason") or t.get("anomaly_reason")
 
-            is_stat_outlier = (std_amt > 0 and amt > (mean_amt + 2.5 * std_amt)) or amt >= 3500.0
+            is_stat_outlier = (std_amt > 0 and amt_usd > (mean_amt + 2.5 * std_amt)) or amt_usd >= 3500.0
             is_high_risk_status = status in ["DISPUTED", "DENIED"]
 
             if is_stat_outlier or is_high_risk_status or db_anomaly:
                 triggers = []
                 if is_stat_outlier:
-                    triggers.append(f"Transaction amount (${amt:,.2f}) is significantly above average (${mean_amt:,.2f})")
+                    triggers.append(f"Transaction amount (${amt_usd:,.2f} USD eq.) is significantly above average (${mean_amt:,.2f})")
                 if is_high_risk_status:
                     triggers.append(f"Critical status flag: {status}")
                 if db_reason and db_reason not in "; ".join(triggers):
@@ -312,7 +328,7 @@ class AnomalyService:
                     "transactionId": t.get("id"),
                     "date": t.get("date") or t.get("createdAt") or "Recent",
                     "customerName": t.get("customerName") or t.get("customer_name") or "Merchant Customer",
-                    "amount": amt,
+                    "amount": raw_amt,
                     "currency": t.get("currency", "USD"),
                     "status": status,
                     "riskScore": risk_score,
@@ -557,11 +573,20 @@ class AnomalyService:
 
         # Model Metadata & Disclaimers
         model_meta = {
-            "algorithm": "Hybrid Isolation Forest (100 trees) + Local Outlier Factor (k=5)" if total_txns >= 10 else "Deterministic Statistical Baseline Mode (N < 10)",
+            "version": self.model_version,
+            "algorithm": (
+                f"Hybrid Isolation Forest ({self.n_estimators} trees) + Local Outlier Factor (k=5)"
+                if total_txns >= 10
+                else "Deterministic Statistical Baseline Mode (N < 10)"
+            ),
             "sampleSize": total_txns,
-            "confidenceScore": min(98, max(50, int(50 + (total_txns * 3.5)))),
+            "confidenceScore": min(98, max(50, int(50 + (total_txns * 3.5)))) if total_txns > 0 else 0,
             "mode": "ML-Active" if total_txns >= 10 else "Statistical-Fallback",
-            "disclaimer": "Finova AI provides merchant self-audit analytics and early financial warning indicators. Finova AI does NOT represent PayPal, predict internal PayPal limitation algorithms, or make decisions on behalf of PayPal risk operations."
+            "anomalyIsConfirmedFraud": False,
+            "disclaimer": (
+                "Anomaly flags indicate statistical feature deviations for merchant review only — "
+                "an anomaly flag does NOT confirm fraud. Finova AI does NOT represent PayPal or predict internal PayPal decisions."
+            ),
         }
 
         # Safe absorption margin (how many more disputes before hitting 1.0%)
@@ -652,5 +677,224 @@ class AnomalyService:
             })
 
         return trends
+
+    def evaluate_benchmark(self, labeled_transactions: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Evaluates statistical/ML outlier flags against a labeled offline evaluation dataset
+        and reports Precision, Recall, F1, False Positive Rate, and False Negative Rate.
+        """
+        if not labeled_transactions:
+            return {
+                "modelVersion": self.model_version,
+                "sampleCount": 0,
+                "precision": 0.0,
+                "recall": 0.0,
+                "f1Score": 0.0,
+                "falsePositiveRate": 0.0,
+                "falseNegativeRate": 0.0,
+            }
+        detected = self.detect_anomalies(labeled_transactions)
+        flagged_ids = {str(item.get("transactionId")) for item in detected if item.get("transactionId") is not None}
+
+        tp = fp = fn = tn = 0
+        for row in labeled_transactions:
+            row_id = str(row.get("id"))
+            actual = bool(row.get("expectedAnomaly"))
+            pred = row_id in flagged_ids
+            if pred and actual:
+                tp += 1
+            elif pred and not actual:
+                fp += 1
+            elif not pred and actual:
+                fn += 1
+            else:
+                tn += 1
+
+        precision = round(tp / (tp + fp), 4) if (tp + fp) > 0 else 0.0
+        recall = round(tp / (tp + fn), 4) if (tp + fn) > 0 else 0.0
+        f1 = round((2 * precision * recall) / (precision + recall), 4) if (precision + recall) > 0 else 0.0
+        fpr = round(fp / (fp + tn), 4) if (fp + tn) > 0 else 0.0
+        fnr = round(fn / (fn + tp), 4) if (fn + tp) > 0 else 0.0
+        return {
+            "modelVersion": self.model_version,
+            "sampleCount": len(labeled_transactions),
+            "truePositives": tp,
+            "falsePositives": fp,
+            "falseNegatives": fn,
+            "trueNegatives": tn,
+            "precision": precision,
+            "recall": recall,
+            "f1Score": f1,
+            "falsePositiveRate": fpr,
+            "falseNegativeRate": fnr,
+        }
+
+    def evaluate_train_test_split(self, random_state: int = 42) -> Dict[str, Any]:
+        """
+        Evaluates unsupervised anomaly detection (Isolation Forest + LOF novelty)
+        using strictly disjoint chronological training and held-out evaluation splits.
+        No test samples or evaluation labels enter baseline fitting or threshold estimation.
+        """
+        rng = np.random.default_rng(random_state)
+        currencies = ["USD", "EUR", "GBP", "JPY"]
+        normal_countries = ["US", "GB", "DE", "CA"]
+
+        # 1. Clean baseline training split (chronologically earlier, N=150 normal transactions)
+        train_txns: List[Dict[str, Any]] = []
+        for idx in range(150):
+            curr = currencies[idx % len(currencies)]
+            usd_target = float(np.clip(rng.normal(280.0, 95.0), 45.0, 620.0))
+            if curr == "JPY":
+                raw_amt = round(usd_target * 150.0, 0)
+            elif curr == "EUR":
+                raw_amt = round(usd_target / 1.08, 2)
+            elif curr == "GBP":
+                raw_amt = round(usd_target / 1.27, 2)
+            else:
+                raw_amt = round(usd_target, 2)
+            day = (idx % 28) + 1
+            train_txns.append({
+                "id": f"TRN-{idx:04d}",
+                "date": f"2026-08-{day:02d} 12:00",
+                "amount": raw_amt,
+                "currency": curr,
+                "country": normal_countries[idx % len(normal_countries)],
+                "status": "COMPLETED",
+            })
+
+        # 2. Disjoint held-out evaluation split (chronologically later, N=100: 75 normal + 25 anomalous)
+        test_txns: List[Dict[str, Any]] = []
+        for idx in range(75):
+            curr = currencies[(idx + 1) % len(currencies)]
+            usd_target = float(np.clip(rng.normal(285.0, 90.0), 50.0, 610.0))
+            if curr == "JPY":
+                raw_amt = round(usd_target * 150.0, 0)
+            elif curr == "EUR":
+                raw_amt = round(usd_target / 1.08, 2)
+            elif curr == "GBP":
+                raw_amt = round(usd_target / 1.27, 2)
+            else:
+                raw_amt = round(usd_target, 2)
+            day = (idx % 28) + 1
+            test_txns.append({
+                "id": f"TST-N-{idx:04d}",
+                "date": f"2026-09-{day:02d} 14:00",
+                "amount": raw_amt,
+                "currency": curr,
+                "country": normal_countries[(idx + 2) % len(normal_countries)],
+                "status": "COMPLETED",
+                "expectedAnomaly": False,
+            })
+
+        anomaly_scenarios = [
+            ("USD", 4850.00, "US", "COMPLETED"),
+            ("EUR", 4200.00, "NG", "DENIED"),
+            ("USD", 3600.00, "RU", "DISPUTED"),
+            ("GBP", 2950.00, "RO", "DISPUTED"),
+            ("JPY", 690000.0, "US", "DENIED"),
+        ]
+        for idx in range(25):
+            curr, amt, country, st = anomaly_scenarios[idx % len(anomaly_scenarios)]
+            day = (idx % 28) + 1
+            test_txns.append({
+                "id": f"TST-A-{idx:04d}",
+                "date": f"2026-09-{day:02d} 18:30",
+                "amount": round(amt * (1.0 + (idx % 4) * 0.08), 2),
+                "currency": curr,
+                "country": country,
+                "status": st,
+                "expectedAnomaly": True,
+            })
+
+        # Verify strict leakage prevention: disjoint IDs and strictly non-overlapping time windows
+        train_ids = {t["id"] for t in train_txns}
+        test_ids = {t["id"] for t in test_txns}
+        train_max_date = max(t["date"] for t in train_txns)
+        test_min_date = min(t["date"] for t in test_txns)
+        leakage_check_passed = len(train_ids.intersection(test_ids)) == 0 and train_max_date < test_min_date
+
+        # Fit strictly on training baseline
+        train_usd = [float(convert_to_usd(t["amount"], t["currency"])) for t in train_txns]
+        train_mean = float(np.mean(train_usd))
+        train_std = max(1.0, float(np.std(train_usd)))
+
+        def _extract_matrix(rows: List[Dict[str, Any]]) -> np.ndarray:
+            feats = []
+            for row in rows:
+                amt_usd = float(convert_to_usd(row["amount"], row["currency"]))
+                is_intl = 1.0 if is_cross_border(row.get("country")) else 0.0
+                st_u = str(row.get("status", "")).upper()
+                is_denied = 1.0 if st_u in ["DENIED", "FAILED"] else 0.0
+                is_refund = 1.0 if st_u == "REFUNDED" else 0.0
+                is_disputed = 1.0 if st_u == "DISPUTED" else 0.0
+                zscore = (amt_usd - train_mean) / train_std
+                feats.append([amt_usd, is_intl, is_denied, is_refund, zscore, is_disputed])
+            return np.array(feats)
+
+        X_train = _extract_matrix(train_txns)
+        X_test = _extract_matrix(test_txns)
+
+        iso_forest = IsolationForest(
+            n_estimators=self.n_estimators,
+            contamination=self.contamination,
+            random_state=random_state,
+            n_jobs=1,
+        )
+        iso_forest.fit(X_train)
+
+        lof_novelty = LocalOutlierFactor(
+            n_neighbors=min(10, len(train_txns) - 1),
+            contamination=self.contamination,
+            novelty=True,
+            n_jobs=1,
+        )
+        lof_novelty.fit(X_train)
+
+        if_preds = iso_forest.predict(X_test)
+        lof_preds = lof_novelty.predict(X_test)
+
+        tp = fp = fn = tn = 0
+        for idx, row in enumerate(test_txns):
+            actual = bool(row["expectedAnomaly"])
+            pred = bool(if_preds[idx] == -1 or lof_preds[idx] == -1)
+            if pred and actual:
+                tp += 1
+            elif pred and not actual:
+                fp += 1
+            elif not pred and actual:
+                fn += 1
+            else:
+                tn += 1
+
+        precision = round(tp / (tp + fp), 4) if (tp + fp) > 0 else 0.0
+        recall = round(tp / (tp + fn), 4) if (tp + fn) > 0 else 0.0
+        f1 = round((2 * precision * recall) / (precision + recall), 4) if (precision + recall) > 0 else 0.0
+        fpr = round(fp / (fp + tn), 4) if (fp + tn) > 0 else 0.0
+        fnr = round(fn / (fn + tp), 4) if (fn + tp) > 0 else 0.0
+
+        return {
+            "modelVersion": self.model_version,
+            "datasetSize": len(train_txns) + len(test_txns),
+            "trainSize": len(train_txns),
+            "testSize": len(test_txns),
+            "positiveCount": sum(1 for t in test_txns if t["expectedAnomaly"]),
+            "negativeCount": sum(1 for t in test_txns if not t["expectedAnomaly"]),
+            "truePositives": tp,
+            "falsePositives": fp,
+            "falseNegatives": fn,
+            "trueNegatives": tn,
+            "precision": precision,
+            "recall": recall,
+            "f1Score": f1,
+            "falsePositiveRate": fpr,
+            "falseNegativeRate": fnr,
+            "leakageCheckPassed": leakage_check_passed,
+            "limitations": (
+                "Offline synthetic multi-currency benchmark measures unsupervised Isolation Forest + LOF(novelty=True) "
+                "separation on held-out synthetic fraud/dispute anomalies. Real production dispute, chargeback, and seller "
+                "behavior requires labeled merchant production outcomes and ongoing drift recalibration."
+            ),
+        }
+
 
 anomaly_service = AnomalyService()

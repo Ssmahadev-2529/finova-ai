@@ -1,6 +1,6 @@
 import React from 'react';
-import { NavigationTab, DataSourceType, User } from '../../types';
-import { Menu, RefreshCw, Sun, Moon, ShieldCheck, UserCheck } from 'lucide-react';
+import { NavigationTab, DataSourceType, User, SystemHealthResponse } from '../../types';
+import { Menu, RefreshCw, Sun, Moon, ShieldCheck } from 'lucide-react';
 
 interface HeaderProps {
   currentTab: NavigationTab;
@@ -13,6 +13,7 @@ interface HeaderProps {
   onToggleTheme: () => void;
   currentUser?: User | null;
   onOpenAuth?: () => void;
+  systemHealth?: SystemHealthResponse | null;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -25,7 +26,8 @@ export const Header: React.FC<HeaderProps> = ({
   theme,
   onToggleTheme,
   currentUser,
-  onOpenAuth
+  onOpenAuth,
+  systemHealth
 }) => {
   const tabTitles: Record<NavigationTab, { title: string; subtitle: string }> = {
     dashboard: {
@@ -34,7 +36,11 @@ export const Header: React.FC<HeaderProps> = ({
     },
     transactions: {
       title: 'Activity & Fee Audit Ledger',
-      subtitle: 'Complete ledger with estimated vs actual PayPal fees and anomaly flags',
+      subtitle: 'Complete ledger with CRUD, CSV export, estimated vs actual fees, and PayPal refunds',
+    },
+    budgets: {
+      title: 'Budgets & Spend Controls',
+      subtitle: 'Multi-currency rolling spend limits, PayPal fee budgets, and custom categories',
     },
     'cost-optimizer': {
       title: 'PayPal Commercial Fee Optimizer',
@@ -50,11 +56,11 @@ export const Header: React.FC<HeaderProps> = ({
     },
     'ai-assistant': {
       title: 'Finova AI Financial Support Agent',
-      subtitle: 'Context-aware financial advisor powered by Gemini for dispute guidance and fee audits',
+      subtitle: 'Context-aware financial advisor powered by Gemini RAG for dispute guidance and fee audits',
     },
     settings: {
-      title: 'Sandbox REST & Webhook Settings',
-      subtitle: 'PayPal Sandbox REST credentials, webhook endpoints, and AI thresholds',
+      title: 'Merchant Account & Platform Settings',
+      subtitle: 'Profile management, password security, API status, and AI thresholds',
     },
   };
 
@@ -116,11 +122,11 @@ export const Header: React.FC<HeaderProps> = ({
             onClick={() => onSelectDataSourceFilter('synthetic')}
             className={`px-2.5 py-1 rounded-lg font-medium flex items-center gap-1.5 transition-all ${
               activeDataSourceFilter === 'synthetic'
-                ? 'bg-indigo-50 dark:bg-[#1E1B4B] text-indigo-700 dark:text-[#A5B4FC] border border-indigo-200 dark:border-[#4338CA]/60 shadow-sm font-semibold'
-                : 'text-slate-500 dark:text-[#8EA1C7] hover:text-indigo-600 dark:hover:text-indigo-400'
+                ? 'bg-sky-50 dark:bg-[#0B2347] text-[#003087] dark:text-[#60CDFF] border border-sky-200 dark:border-[#0070BA]/60 shadow-sm font-semibold'
+                : 'text-slate-500 dark:text-[#8EA1C7] hover:text-[#0070BA] dark:hover:text-[#60CDFF]'
             }`}
           >
-            <span className="w-1.5 h-1.5 rounded-full bg-indigo-500"></span>
+            <span className="w-1.5 h-1.5 rounded-full bg-[#0070BA]"></span>
             Synthetic Demo
           </button>
         </div>
@@ -139,10 +145,22 @@ export const Header: React.FC<HeaderProps> = ({
           )}
         </button>
 
+        {/* Live Backend Health Status Pill */}
+        {systemHealth && (
+          <div
+            title={`Backend: ${systemHealth.status} | DB: ${systemHealth.database || 'OK'}`}
+            className="hidden lg:flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 text-[10px] font-mono font-bold text-emerald-700 dark:text-emerald-300"
+          >
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
+            <span>API {systemHealth.status}</span>
+          </div>
+        )}
+
         {/* Sync / Refresh Button */}
         <button
           onClick={onRefreshData}
           disabled={isRefreshing}
+          aria-label="Refresh PayPal sandbox events and ledger"
           className="p-2 rounded-xl bg-slate-100 dark:bg-[#07132B] border border-slate-200/90 dark:border-white/[0.08] text-slate-600 dark:text-[#8EA1C7] hover:text-[#0070BA] dark:hover:text-[#38BDF8] transition-all btn-press"
           title="Refresh PayPal sandbox events & ledger"
         >
@@ -152,6 +170,7 @@ export const Header: React.FC<HeaderProps> = ({
         {/* PayPal Sandbox Merchant Account Pill / Auth Trigger */}
         <button
           onClick={onOpenAuth}
+          aria-label={currentUser ? `Account menu for ${currentUser.email}` : 'Sign in or register'}
           className="flex items-center gap-2 pl-2 border-l border-slate-200 dark:border-white/[0.08] hover:opacity-90 transition-opacity text-left btn-press"
           title={currentUser ? `Logged in as ${currentUser.email}` : "Click to log in or register"}
         >

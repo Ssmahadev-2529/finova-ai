@@ -548,7 +548,7 @@ Thank you for using PayPal.`
             <div className="p-4 rounded-2xl bg-white dark:bg-[#081329] border border-slate-200 dark:border-[#162F64] shadow-sm">
               <div className="text-xs text-slate-500 dark:text-[#7E96C4] font-semibold">Average Risk Score</div>
               <div className="text-2xl font-extrabold text-amber-600 dark:text-[#FFC439] font-mono mt-1">
-                {threatDistribution?.averageRiskScore ?? 62.4}/100
+                {(threatDistribution?.averageRiskScore ?? 0).toFixed(1)}/100
               </div>
               <div className="text-[11px] text-slate-400 mt-1">Across analyzed payloads</div>
             </div>
@@ -556,7 +556,7 @@ Thank you for using PayPal.`
             <div className="p-4 rounded-2xl bg-white dark:bg-[#081329] border border-slate-200 dark:border-[#162F64] shadow-sm">
               <div className="text-xs text-slate-500 dark:text-[#7E96C4] font-semibold">Critical Threat Rate</div>
               <div className="text-2xl font-extrabold text-rose-600 dark:text-rose-400 font-mono mt-1">
-                {threatDistribution?.distribution?.CRITICAL?.percentage ?? 40.0}%
+                {(threatDistribution?.distribution?.CRITICAL?.percentage ?? 0).toFixed(1)}%
               </div>
               <div className="text-[11px] text-rose-500/80 mt-1">Active phishing or overpayment</div>
             </div>
@@ -564,7 +564,7 @@ Thank you for using PayPal.`
             <div className="p-4 rounded-2xl bg-white dark:bg-[#081329] border border-slate-200 dark:border-[#162F64] shadow-sm">
               <div className="text-xs text-slate-500 dark:text-[#7E96C4] font-semibold">Threat Vectors Flagged</div>
               <div className="text-2xl font-extrabold text-[#0070BA] dark:text-[#38BDF8] font-mono mt-1">
-                {threatDistribution?.threatIndicatorsFound ?? 8}
+                {threatDistribution?.threatIndicatorsFound ?? 0}
               </div>
               <div className="text-[11px] text-slate-400 mt-1">Urgency, shorteners, domains</div>
             </div>

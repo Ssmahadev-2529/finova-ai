@@ -9,12 +9,18 @@ export default {
     extend: {
       colors: {
         paypal: {
+          canvas: '#F5F7FA',
+          surface: '#FFFFFF',
+          borderSubtle: '#E3E8EE',
+          ink: '#001435',
           darkNavy: '#001435',
           navy: '#001C64',
           deepBlue: '#003087',
-          blue: '#00457C',
+          blue: '#0070BA',
+          blueHover: '#005EA6',
           brightBlue: '#0070BA',
           lightBlue: '#0079C1',
+          sky: '#009CDE',
           cyan: '#00CFDE',
           yellow: '#FFC439',
           yellowHover: '#F2BA36',
@@ -49,7 +55,8 @@ export default {
         }
       },
       fontFamily: {
-        sans: ['Inter', 'system-ui', '-apple-system', 'BlinkMacSystemFont', 'Segoe UI', 'Roboto', 'sans-serif'],
+        display: ['"Plus Jakarta Sans"', 'Inter', 'system-ui', '-apple-system', 'sans-serif'],
+        sans: ['Inter', '"Plus Jakarta Sans"', 'system-ui', '-apple-system', 'BlinkMacSystemFont', 'Segoe UI', 'Roboto', 'sans-serif'],
         mono: ['JetBrains Mono', 'Fira Code', 'Cascadia Code', 'monospace']
       },
       boxShadow: {

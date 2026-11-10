@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { User, SecurityAuditLog } from '../../types';
 import { api } from '../../services/api';
 import { PayPalLogo } from './PayPalLogo';
@@ -50,6 +50,23 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
   const [auditLogs, setAuditLogs] = useState<SecurityAuditLog[]>([]);
   const [auditLoading, setAuditLoading] = useState(false);
+  const autoCloseTimerRef = useRef<number | null>(null);
+
+  const clearAutoCloseTimer = () => {
+    if (autoCloseTimerRef.current !== null) {
+      window.clearTimeout(autoCloseTimerRef.current);
+      autoCloseTimerRef.current = null;
+    }
+  };
+
+  useEffect(() => {
+    if (!isOpen) {
+      clearAutoCloseTimer();
+      setSuccessMsg(null);
+      setErrorMsg(null);
+    }
+    return () => clearAutoCloseTimer();
+  }, [isOpen]);
 
   useEffect(() => {
     if (isOpen && initialResetToken) {
@@ -97,7 +114,8 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       const res = await api.login({ email, password });
       onAuthChange(res.user);
       setSuccessMsg(`Welcome back, ${res.user.fullName}! Authenticated with JWT session.`);
-      setTimeout(() => {
+      clearAutoCloseTimer();
+      autoCloseTimerRef.current = window.setTimeout(() => {
         onClose();
         setSuccessMsg(null);
       }, 1500);
@@ -120,8 +138,10 @@ export const AuthModal: React.FC<AuthModalProps> = ({
         businessName
       });
       onAuthChange(res.user);
+      setMode('login');
       setSuccessMsg(`Account created successfully! Logged in as ${res.user.fullName}.`);
-      setTimeout(() => {
+      clearAutoCloseTimer();
+      autoCloseTimerRef.current = window.setTimeout(() => {
         onClose();
         setSuccessMsg(null);
       }, 1500);
@@ -156,7 +176,8 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       setResetToken('');
       setNewPassword('');
       onClearResetToken?.();
-      setTimeout(() => {
+      clearAutoCloseTimer();
+      autoCloseTimerRef.current = window.setTimeout(() => {
         setMode('login');
         setSuccessMsg(null);
       }, 2000);
@@ -175,7 +196,8 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       setMode('login');
       onAuthChange(null);
       setSuccessMsg('Logged out successfully. Token revoked.');
-      setTimeout(() => {
+      clearAutoCloseTimer();
+      autoCloseTimerRef.current = window.setTimeout(() => {
         onClose();
         setSuccessMsg(null);
       }, 1000);
@@ -189,10 +211,24 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     }
   };
 
+  useEffect(() => {
+    if (!isOpen) return;
+    const onEsc = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onEsc);
+    return () => window.removeEventListener('keydown', onEsc);
+  }, [isOpen, onClose]);
+
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-in fade-in">
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="Finova Security and Authentication"
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-in fade-in"
+    >
       <div className="fintech-card max-w-md w-full shadow-2xl overflow-hidden flex flex-col border border-slate-200/90 dark:border-white/[0.12]">
         {/* Modal Header */}
         <div className="bg-gradient-to-r from-[#002875] to-[#00457C] text-white p-4 flex items-center justify-between">
@@ -207,6 +243,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
           </div>
           <button
             onClick={onClose}
+            aria-label="Close authentication modal"
             className="p-1.5 rounded-lg hover:bg-white/10 text-white transition-colors"
           >
             <X className="w-4 h-4" />
@@ -503,7 +540,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               ) : (
                 <form onSubmit={handleResetPassword} className="space-y-3">
                   <p className="text-slate-600 dark:text-[#9BB0D6]">
-                    Choose a strong new password (minimum 8 characters with uppercase, lowercase, and a digit).
+                    Choose a strong new password (minimum 10 characters with uppercase, lowercase, digit, and special character).
                   </p>
                   <input
                     type="password"
@@ -570,7 +607,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                           log.status === 'SUCCESS'
                             ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
                             : log.status === 'BLOCKED'
-                            ? 'bg-purple-500/15 text-purple-600 dark:text-purple-400'
+                            ? 'bg-amber-500/15 text-amber-700 dark:text-amber-400'
                             : 'bg-rose-500/15 text-rose-600 dark:text-rose-400'
                         }`}>
                           {log.status}

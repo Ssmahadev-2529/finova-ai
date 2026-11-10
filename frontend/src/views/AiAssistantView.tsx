@@ -156,7 +156,7 @@ You can ask me questions about your revenue, transaction fee breakdowns, failed 
         id: `ASST-${Date.now()}`,
         sender: 'assistant',
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        content: res.reply,
+        content: res.reply + (res.groundingSource ? `\n\n_Source: ${res.groundingSource}${res.retrievedSources?.length ? ` (${res.retrievedSources.slice(0, 3).join(', ')})` : ''}_` : ''),
         category: (res.category as any) || 'general',
         financialCard: res.financialCard,
         suggestedFollowUps: res.suggestedFollowUps
@@ -321,7 +321,7 @@ You can ask me questions about your revenue, transaction fee breakdowns, failed 
                 Finova AI Financial Support Agent
               </h2>
               <span className="text-[10px] px-2 py-0.5 rounded-full bg-[#0070BA]/15 text-[#0070BA] dark:text-[#38BDF8] border border-[#0070BA]/30 font-mono font-bold">
-                Gemini Model Active
+                Tenant-Scoped RAG
               </span>
             </div>
             <p className="text-xs text-slate-500 dark:text-[#7E96C4]">
@@ -339,6 +339,7 @@ You can ask me questions about your revenue, transaction fee breakdowns, failed 
 
           <button
             onClick={handleClearChat}
+            aria-label="Reset conversation history"
             title="Reset conversation history"
             className="p-2 rounded-xl text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-white bg-slate-100 hover:bg-slate-200 dark:bg-[#0E2046] border border-slate-200 dark:border-[#20438A] transition-colors shadow-sm"
           >

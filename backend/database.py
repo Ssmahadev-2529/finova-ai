@@ -1,7 +1,7 @@
 import logging
 import threading
 from typing import Callable, Optional
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 from config import settings
 
@@ -16,10 +16,13 @@ REQUIRED_TABLES = (
     "paypal_orders",
     "transactions",
     "scam_audit_logs",
+    "categories",
+    "budgets",
+    "ai_usage_logs",
 )
 REQUIRED_COLUMNS = {
     "users": ("token_version",),
-    "transactions": ("user_id",),
+    "transactions": ("user_id", "category", "txn_type", "notes", "updated_at"),
     "scam_audit_logs": ("user_id",),
 }
 _LOCAL_INIT_LOCK = threading.Lock()
@@ -46,6 +49,13 @@ elif db_url.startswith("postgresql"):
 
 engine = create_engine(db_url, **engine_kwargs)
 
+if db_url.startswith("sqlite"):
+    @event.listens_for(engine, "connect")
+    def _enable_sqlite_foreign_keys(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
@@ -69,6 +79,22 @@ def _apply_additive_migrations(conn) -> None:
         if "user_id" not in txn_columns:
             conn.execute(text("ALTER TABLE transactions ADD COLUMN user_id VARCHAR(64)"))
             logger.info("Migrated transactions table: added nullable user_id column.")
+        if "category" not in txn_columns:
+            conn.execute(text("ALTER TABLE transactions ADD COLUMN category VARCHAR(64) DEFAULT 'Payment'"))
+            logger.info("Migrated transactions table: added category column.")
+        if "txn_type" not in txn_columns:
+            conn.execute(text("ALTER TABLE transactions ADD COLUMN txn_type VARCHAR(16) DEFAULT 'income'"))
+            logger.info("Migrated transactions table: added txn_type column.")
+        if "notes" not in txn_columns:
+            conn.execute(text("ALTER TABLE transactions ADD COLUMN notes TEXT"))
+            logger.info("Migrated transactions table: added notes column.")
+        if "updated_at" not in txn_columns:
+            conn.execute(text("ALTER TABLE transactions ADD COLUMN updated_at TIMESTAMP"))
+            logger.info("Migrated transactions table: added updated_at column.")
+
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_transactions_user_created ON transactions (user_id, created_at)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_transactions_user_status ON transactions (user_id, status)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_transactions_user_category ON transactions (user_id, category)"))
 
     if "users" in existing_tables:
         user_columns = {col["name"] for col in inspector.get_columns("users")}
@@ -83,6 +109,12 @@ def _apply_additive_migrations(conn) -> None:
         if "user_id" not in scam_columns:
             conn.execute(text("ALTER TABLE scam_audit_logs ADD COLUMN user_id VARCHAR(64)"))
             logger.info("Migrated scam_audit_logs table: added nullable user_id column.")
+
+    if "categories" in existing_tables:
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_categories_user_name_uq ON categories (user_id, name)"))
+
+    if "budgets" in existing_tables:
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_budgets_user_category_uq ON budgets (user_id, category)"))
 
 
 def ensure_schema_migrations(target_engine=None) -> None:
@@ -120,6 +152,7 @@ def initialize_database(
     """
     import models.user  # noqa: F401
     import models.transaction  # noqa: F401
+    import models.finance  # noqa: F401
 
     eng = target_engine or engine
     is_postgres = eng.dialect.name == "postgresql"

@@ -1,16 +1,18 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, Header, status
 from sqlalchemy.orm import Session
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel, Field, EmailStr, field_validator
 from typing import Optional, Dict, Any
 
 from database import get_db
 from config import settings
 from models.user import UserModel, AuditLogModel
+from datetime import datetime
 from services.auth_service import (
     auth_service,
     get_current_user,
     get_optional_current_user,
-    get_client_meta
+    get_client_meta,
+    require_authenticated_user,
 )
 from services.email_service import (
     EmailDeliveryProvider,
@@ -28,6 +30,14 @@ class RegisterRequest(BaseModel):
     fullName: str = Field(..., min_length=2, max_length=128)
     businessName: str = Field(..., min_length=2, max_length=128)
 
+    @field_validator("fullName", "businessName")
+    @classmethod
+    def validate_non_whitespace(cls, v: str) -> str:
+        cleaned = v.strip()
+        if len(cleaned) < 2:
+            raise ValueError("Field must contain at least 2 non-whitespace characters.")
+        return cleaned
+
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str = Field(..., min_length=1)
@@ -43,6 +53,24 @@ class AuthResponse(BaseModel):
     accessToken: str
     tokenType: str = "bearer"
     user: Dict[str, Any]
+
+
+class UpdateProfileRequest(BaseModel):
+    fullName: str = Field(..., min_length=2, max_length=128)
+    businessName: str = Field(..., min_length=2, max_length=128)
+
+    @field_validator("fullName", "businessName")
+    @classmethod
+    def validate_non_whitespace(cls, v: str) -> str:
+        cleaned = v.strip()
+        if len(cleaned) < 2:
+            raise ValueError("Field must contain at least 2 non-whitespace characters.")
+        return cleaned
+
+
+class ChangePasswordRequest(BaseModel):
+    currentPassword: str = Field(..., min_length=1)
+    newPassword: str = Field(..., min_length=8)
 
 
 @router.post("/register", response_model=AuthResponse, status_code=status.HTTP_201_CREATED)
@@ -176,7 +204,99 @@ def get_profile(current_user: UserModel = Depends(get_current_user)):
     """
     Returns the authenticated merchant's profile.
     """
-    return current_user.to_dict()
+    user = require_authenticated_user(current_user)
+    return user.to_dict()
+
+
+@router.put("/profile")
+def update_profile(
+    req: UpdateProfileRequest,
+    request: Request,
+    current_user: UserModel = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Updates authenticated merchant's display name and business name."""
+    user = require_authenticated_user(current_user)
+    ip, ua = get_client_meta(request)
+
+    user.full_name = req.fullName.strip()
+    user.business_name = req.businessName.strip()
+    user.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(user)
+
+    auth_service.record_audit(
+        db=db,
+        action="USER_PROFILE_UPDATED",
+        user_id=user.id,
+        ip_address=ip,
+        user_agent=ua,
+        status="SUCCESS",
+    )
+    return user.to_dict()
+
+
+@router.post("/change-password", response_model=AuthResponse)
+def change_password(
+    req: ChangePasswordRequest,
+    request: Request,
+    current_user: UserModel = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Verifies current password, enforces strength policy, updates password with bcrypt-12,
+    rotates token_version to invalidate old sessions, and issues a fresh access token.
+    """
+    user = require_authenticated_user(current_user)
+    ip, ua = get_client_meta(request)
+
+    if not auth_service.verify_password(req.currentPassword, user.hashed_password):
+        auth_service.record_audit(
+            db=db,
+            action="USER_PASSWORD_CHANGE_FAILED",
+            user_id=user.id,
+            ip_address=ip,
+            user_agent=ua,
+            status="FAILURE",
+            details={"reason": "Invalid current password"},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Current password is incorrect.",
+        )
+
+    is_strong, reason = auth_service.validate_password_strength(req.newPassword)
+    if not is_strong:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=reason)
+
+    db.query(UserModel).filter(UserModel.id == user.id).update(
+        {
+            UserModel.hashed_password: auth_service.hash_password(req.newPassword),
+            UserModel.token_version: UserModel.token_version + 1,
+            UserModel.updated_at: datetime.utcnow(),
+        },
+        synchronize_session=False,
+    )
+    db.commit()
+    db.refresh(user)
+
+    new_token = auth_service.create_access_token(
+        {
+            "sub": user.id,
+            "email": user.email,
+            "role": user.role,
+            "tv": user.token_version,
+        }
+    )
+    auth_service.record_audit(
+        db=db,
+        action="USER_PASSWORD_CHANGED",
+        user_id=user.id,
+        ip_address=ip,
+        user_agent=ua,
+        status="SUCCESS",
+    )
+    return AuthResponse(accessToken=new_token, user=user.to_dict())
 
 @router.post("/forgot-password")
 def forgot_password(
@@ -276,8 +396,18 @@ def reset_password(
     Resets user password given a valid unexpired reset token.
     """
     ip, ua = get_client_meta(request)
-    success = auth_service.reset_password(db=db, reset_token=req.resetToken, new_password=req.newPassword)
-    
+    try:
+        success = auth_service.reset_password(db=db, reset_token=req.resetToken, new_password=req.newPassword)
+    except HTTPException:
+        auth_service.record_audit(
+            db=db,
+            action="PASSWORD_RESET_FAILED",
+            ip_address=ip,
+            user_agent=ua,
+            status="FAILURE",
+        )
+        raise
+
     auth_service.record_audit(
         db=db,
         action="PASSWORD_RESET_COMPLETED",
@@ -285,7 +415,7 @@ def reset_password(
         user_agent=ua,
         status="SUCCESS" if success else "FAILURE"
     )
-    
+
     return {"status": "SUCCESS", "message": "Password has been successfully updated. You may now log in."}
 
 @router.get("/audit-logs")
@@ -306,7 +436,7 @@ def get_audit_logs(
             headers={"WWW-Authenticate": "Bearer"}
         )
 
-    clamped_limit = max(1, min(200, int(limit))) if isinstance(limit, int) else 50
+    clamped_limit = max(1, min(200, int(limit))) if (isinstance(limit, int) and not isinstance(limit, bool)) else 50
     clean_user_id = user_id.strip() if isinstance(user_id, str) and user_id.strip() else None
 
     query = db.query(AuditLogModel)

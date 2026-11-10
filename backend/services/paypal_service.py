@@ -301,6 +301,53 @@ class PayPalService:
 
         return response.json()
 
+    async def refund_capture(
+        self,
+        capture_id: str,
+        amount: Optional[Union[Decimal, float, int, str]] = None,
+        currency: Optional[str] = None,
+        note_to_payer: Optional[str] = None,
+        request_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Issues an idempotent refund against a captured PayPal payment via Payments API v2.
+        """
+        token = await self.get_access_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Prefer": "return=representation",
+            "PayPal-Request-Id": (request_id or f"refund-{capture_id}").strip(),
+        }
+        payload: Dict[str, Any] = {}
+        if amount is not None and currency:
+            curr = currency.strip().upper()
+            payload["amount"] = {
+                "value": format_paypal_amount(amount, curr),
+                "currency_code": curr,
+            }
+        if note_to_payer:
+            payload["note_to_payer"] = note_to_payer.strip()[:255]
+
+        try:
+            async with httpx.AsyncClient(timeout=20.0, follow_redirects=False) as client:
+                response = await client.post(
+                    f"{self.base_url}/v2/payments/captures/{capture_id}/refund",
+                    headers=headers,
+                    json=payload,
+                )
+        except (httpx.TimeoutException, httpx.RequestError) as exc:
+            raise PayPalAmbiguousError(f"PayPal Refund transport error: {type(exc).__name__}") from exc
+
+        self._reject_redirect(response, "refund_capture")
+        if response.status_code >= 500:
+            raise PayPalAmbiguousError(f"PayPal Refund server error [{response.status_code}]")
+        if response.status_code not in (200, 201):
+            error_name, msg = self._parse_paypal_error(response)
+            raise PayPalAPIError(response.status_code, f"PayPal Refund error [{response.status_code}]: {msg}", error_name)
+
+        return response.json()
+
     def parse_capture_response(self, capture_data: Dict[str, Any]) -> Dict[str, Any]:
         """
         Extracts gross, actual fee, net amount (as exact Decimals), buyer details,

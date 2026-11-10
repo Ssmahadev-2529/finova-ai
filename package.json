@@ -19,5 +19,10 @@
     "cost-optimizer"
   ],
   "author": "",
-  "license": "MIT"
+  "license": "MIT",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "type": "commonjs"
 }

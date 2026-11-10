@@ -118,6 +118,15 @@ export const SimulatePaymentModal: React.FC<SimulatePaymentModalProps> = ({
     }
   }, [isOpen, paypalConfig, amount, currency]);
 
+  useEffect(() => {
+    if (!isOpen) return;
+    const handleEsc = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', handleEsc);
+    return () => window.removeEventListener('keydown', handleEsc);
+  }, [isOpen, onClose]);
+
   if (!isOpen) return null;
 
   // Direct backend simulated capture (works even if PayPal credentials haven't been entered in .env yet)
@@ -126,13 +135,25 @@ export const SimulatePaymentModal: React.FC<SimulatePaymentModalProps> = ({
       setErrorMessage('Authentication required: Please sign in first to simulate or capture a payment.');
       return;
     }
+    if (!customerName.trim()) {
+      setErrorMessage('Sandbox buyer name is required.');
+      return;
+    }
+    if (!customerEmail.trim() || !customerEmail.includes('@')) {
+      setErrorMessage('A valid buyer email address is required.');
+      return;
+    }
+    if (!Number.isFinite(amount) || amount <= 0) {
+      setErrorMessage('Order amount must be greater than zero.');
+      return;
+    }
     setIsProcessing(true);
     setErrorMessage(null);
 
     try {
       const newTxn = await api.simulateTransaction({
-        customerName,
-        customerEmail,
+        customerName: customerName.trim(),
+        customerEmail: customerEmail.trim(),
         amount,
         currency,
         paymentMethod: selectedMethod,
@@ -149,7 +170,12 @@ export const SimulatePaymentModal: React.FC<SimulatePaymentModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 dark:bg-black/80 backdrop-blur-md animate-in fade-in">
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="PayPal Sandbox Checkout Simulator"
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 dark:bg-black/80 backdrop-blur-md animate-in fade-in"
+    >
       <div className="bg-white dark:bg-[#071126] border border-slate-200/90 dark:border-white/[0.12] rounded-3xl w-full max-w-lg overflow-hidden shadow-2xl">
         {/* PayPal Sandbox Header */}
         <div className="p-5 border-b border-slate-200/80 dark:border-white/[0.08] flex items-center justify-between bg-slate-50/70 dark:bg-[#040A18]/70">
@@ -161,6 +187,7 @@ export const SimulatePaymentModal: React.FC<SimulatePaymentModalProps> = ({
           </div>
           <button
             onClick={onClose}
+            aria-label="Close checkout simulator modal"
             className="p-1.5 rounded-full text-slate-400 hover:text-slate-700 hover:bg-slate-200 dark:hover:text-white dark:hover:bg-white/10 transition-colors btn-press"
           >
             <X className="w-5 h-5" />

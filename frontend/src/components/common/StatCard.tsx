@@ -29,7 +29,7 @@ export const StatCard: React.FC<StatCardProps> = ({
     emerald: 'border-emerald-500/25 text-emerald-700 dark:text-emerald-400 bg-emerald-500/10',
     amber: 'border-amber-500/25 text-amber-700 dark:text-amber-400 bg-amber-500/10',
     rose: 'border-rose-500/25 text-rose-700 dark:text-rose-400 bg-rose-500/10',
-    purple: 'border-purple-500/25 text-purple-700 dark:text-purple-400 bg-purple-500/10',
+    purple: 'border-[#003087]/25 text-[#003087] dark:text-[#60CDFF] bg-[#003087]/10',
   }[accentColor];
 
   return (

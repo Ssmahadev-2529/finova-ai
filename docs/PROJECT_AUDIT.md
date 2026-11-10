@@ -1,9 +1,9 @@
-# Finova AI — Complete Project Audit (Phase 0 Baseline)
+# Finova AI — Complete Project Audit (Baseline & Remediation Record)
 
 **Audit Date:** 2026-11-10  
 **Repository:** `D:\Myprojects\finova`  
-**Git Status:** Initialized on `master`, `No commits yet` (all repository files untracked; `.gitignore` and `backend/.gitignore` exclude `.env`, `.env.*`, `*.db`, `*.sqlite3`, `node_modules/`, `dist/`).  
-**Environment Tooling Verified:** `python` (3.12), `node`, `npm`, `npx` present locally. `psql`, `redis-server`, `redis-cli`, `docker`, `render`, `vercel`, `gh`, `playwright` are **not installed locally**. `vercel-plugin` MCP server is installed but unsigned-in.
+**Git Baseline Commit:** `7a8d43b` on branch `master` (`.gitignore` and `backend/.gitignore` exclude `.env`, `.env.*`, `*.db`, `*.sqlite3`, `node_modules/`, `dist/`).  
+**Environment Tooling Verified:** `python` (3.12), `node`, `npm`, `npx`, Chrome, Edge, and scratch `playwright-core` runner present locally. `psql`, `redis-server`, `docker`, `render`, `vercel`, and `gh` CLI are not installed locally; `vercel-plugin` is installed and requires user sign-in. Both orphan files (`index.html` and `frontend/public/meridian.html`) have been removed.
 
 ---
 
@@ -74,3 +74,18 @@ Status taxonomy: `COMPLETE` | `PARTIALLY COMPLETE` | `BROKEN` | `MISSING` | `NEE
 | **BUG-10** | **P2 (Medium)** | Frontend UX, Light-Theme Contrast, Accessibility & Form Validation | Dark-on-light contrast bug (`CostOptimizerView.tsx:778`), unvalidated custom buttons in `SimulatePaymentModal`, missing dialog ARIA/Escape/focus handling, silent API fallbacks, missing confirmation dialogs. |
 | **BUG-11** | **P3 (Low)** | Code Duplication & Orphan Files | Duplicated `_parse_date`, fee schedules, redaction regexes, double ML run per chat turn, unused UI state (`scenarioResults`, `selectedAuditLog`), orphan `meridian.html`. |
 | **BLK-01** | **EXTERNAL BLOCKER** | Staging & Production Infra | Local environment lacks PostgreSQL, Redis, Docker, Render CLI, Vercel CLI, Playwright browsers; `vercel-plugin` requires user sign-in; live staging/prod credentials & deployment authorization not yet provided. |
+
+---
+
+## 4. Phase 1–16 Remediation Resolution Summary (2026-11-10)
+
+All actionable software defects (`BUG-01` through `BUG-11`) identified during Phase 0 were resolved and independently verified:
+- **Resolved (`BUG-01` to `BUG-11`):**
+  - Centralized monetary/FX/country/date/redaction/CSV safety helpers in `backend/services/shared_utils.py`.
+  - Remediated PayPal domestic `"US"` surcharge, added `/api/v1/paypal/refund` (`REFUNDING`/`REFUND_UNKNOWN`), `/api/v1/paypal/orders/{order_id}` safe sync, and refund/dispute webhooks.
+  - Added full manual Transaction CRUD (`POST`/`GET`/`PUT`/`PATCH`/`DELETE`), `/transactions/paged`, formula-escaped CSV `/transactions/export`, `CategoryModel`/`BudgetModel`/`AIUsageLogModel`, multi-currency rolling `/budgets/utilization`, `PUT /auth/profile`, and `POST /auth/change-password`.
+  - Fixed `get_revenue_forecast` (`"net"`), `"qr_code"` fixed fees, chronological volatility/comparison splits, thread-safe `IsolationForest` + `LOF`, USD FX normalization in ML & analytics, multi-turn AI RAG history sanitization, and dynamic Gemini API key resolution.
+  - Updated frontend (`App.tsx`, `BudgetsView.tsx`, `TransactionsView.tsx`, `DashboardView.tsx`, `CostOptimizerView.tsx`, `ScamShieldView.tsx`, `AccountHealthView.tsx`, `SettingsView.tsx`, `AuthModal.tsx`, `SimulatePaymentModal.tsx`, `StatusBadge.tsx`), eradicated `frontend/public/meridian.html`, eliminated fake fallback KPIs/charts, fixed light-mode contrast, and added Vitest + React Testing Library tests.
+- **Independent Review Verdict:** Backend security & code re-review **APPROVED** (`0` remaining P0/P1/P2 findings).
+- **Remaining External Blocker (`BLK-01`):** Cloud staging & production execution (`Phase 2B`, `Phase 15`, `Phase 17`) remain blocked solely by external infrastructure provisioning (`PostgreSQL`, `Redis`, `Render`, `Vercel` sign-in) and explicit deployment authorization.
+

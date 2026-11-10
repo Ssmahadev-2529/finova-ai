@@ -7,39 +7,74 @@ and anomaly insights.
 
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
+from decimal import Decimal
 from collections import defaultdict
 import numpy as np
 from sqlalchemy.orm import Session
 from models.transaction import TransactionModel
 from services.auth_service import scope_transaction_query
+from services.shared_utils import (
+    USD_EXCHANGE_RATES,
+    convert_to_usd,
+    is_domestic_us,
+    parse_strict_filter_date,
+    parse_transaction_datetime,
+    quantize_currency,
+    to_decimal,
+)
+
 
 class TransactionAnalyticsService:
     def __init__(self):
         pass
 
-    def get_summary(self, db: Session, scoped_user_id: Optional[str] = None) -> Dict[str, Any]:
+    def get_summary(
+        self,
+        db: Session,
+        scoped_user_id: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         Calculates high-level transaction intelligence metrics from the database:
-        - Total transaction volume (gross)
-        - Net received balance (settled into merchant account)
-        - Confirmed actual PayPal fees vs estimated commercial fees
-        - Status breakdowns (COMPLETED, PENDING, DENIED, REFUNDED, DISPUTED)
-        - Data source breakdown (PayPal sandbox vs synthetic test data)
+        - Total transaction volume (FX-normalized to USD portfolio equivalent via Decimal math)
+        - Income, expenses, and net cash flow breakdown
+        - Confirmed actual PayPal fees vs estimated commercial fees (preserving $0.00 fees)
+        - Status, category, and data source breakdowns
         """
         query = scope_transaction_query(db.query(TransactionModel), TransactionModel, scoped_user_id)
         transactions = query.order_by(TransactionModel.created_at.desc()).all()
-        
+
+        if date_from or date_to:
+            start_dt = parse_strict_filter_date(date_from) if date_from else None
+            end_dt = parse_strict_filter_date(date_to) if date_to else None
+            if end_dt and len((date_to or "").strip()) <= 10:
+                end_dt = end_dt.replace(hour=23, minute=59, second=59)
+            filtered = []
+            for t in transactions:
+                dt = parse_transaction_datetime(t.date, t.created_at)
+                if start_dt and dt < start_dt:
+                    continue
+                if end_dt and dt > end_dt:
+                    continue
+                filtered.append(t)
+            transactions = filtered
+
         if not transactions:
             return {
                 "totalTransactions": 0,
                 "grossPaymentVolume": 0.0,
                 "completedVolume": 0.0,
                 "totalNetReceived": 0.0,
+                "totalIncome": 0.0,
+                "totalExpenses": 0.0,
+                "netCashFlow": 0.0,
                 "totalFees": 0.0,
                 "totalActualFees": 0.0,
                 "totalEstimatedFees": 0.0,
                 "confirmedFeeCoveragePct": 0.0,
                 "averageTicketSize": 0.0,
+                "categoryBreakdown": [],
                 "statusBreakdown": {},
                 "sourceBreakdown": {"sandbox": {"count": 0, "volume": 0.0}, "synthetic": {"count": 0, "volume": 0.0}},
                 "riskMetrics": {
@@ -53,25 +88,43 @@ class TransactionAnalyticsService:
             }
 
         total_txns = len(transactions)
-        gross_volume = sum(t.amount for t in transactions if t.status != "DENIED")
-        completed_txns = [t for t in transactions if t.status == "COMPLETED"]
-        completed_volume = sum(t.amount for t in completed_txns)
-        total_net = sum(t.net_amount for t in completed_txns)
+        income_txns = [t for t in transactions if (getattr(t, "txn_type", None) or "income").lower() != "expense"]
+        expense_txns = [t for t in transactions if (getattr(t, "txn_type", None) or "income").lower() == "expense"]
 
-        # Fee calculations: distinguish actual fees from estimated fees
-        actual_fee_txns = [t for t in transactions if t.actual_fee is not None and t.actual_fee > 0]
-        total_actual_fees = sum(t.actual_fee for t in actual_fee_txns)
-        total_estimated_fees = sum(t.estimated_fee for t in transactions if t.estimated_fee is not None)
-        
-        # Total effective fees (use actual_fee when available, else fallback to estimated_fee)
-        total_effective_fees = sum(
-            (t.actual_fee if t.actual_fee is not None else t.estimated_fee)
-            for t in transactions
-            if t.status in ["COMPLETED", "DISPUTED"]
+        gross_volume_dec = sum(
+            (convert_to_usd(t.amount, t.currency) for t in income_txns if t.status != "DENIED"),
+            Decimal("0.00"),
+        )
+        completed_income = [t for t in income_txns if t.status == "COMPLETED"]
+        completed_volume_dec = sum((convert_to_usd(t.amount, t.currency) for t in completed_income), Decimal("0.00"))
+        total_net_dec = sum((convert_to_usd(t.net_amount, t.currency) for t in completed_income), Decimal("0.00"))
+
+        total_expenses_dec = sum(
+            (convert_to_usd(t.amount, t.currency) for t in expense_txns if t.status != "DENIED"),
+            Decimal("0.00"),
+        )
+        net_cash_flow_dec = (total_net_dec - total_expenses_dec).quantize(Decimal("0.01"))
+
+        # Fee calculations: distinguish confirmed actual fees ($0.00 included) from estimates
+        actual_fee_txns = [t for t in transactions if t.actual_fee is not None]
+        total_actual_fees_dec = sum((convert_to_usd(t.actual_fee, t.currency) for t in actual_fee_txns), Decimal("0.00"))
+        total_estimated_fees_dec = sum(
+            (convert_to_usd(t.estimated_fee, t.currency) for t in transactions if t.estimated_fee is not None),
+            Decimal("0.00"),
         )
 
+        total_effective_fees_dec = sum(
+            (
+                convert_to_usd(t.actual_fee if t.actual_fee is not None else t.estimated_fee, t.currency)
+                for t in income_txns
+                if t.status in ["COMPLETED", "DISPUTED"]
+            ),
+            Decimal("0.00"),
+        )
+
+        valid_income_count = len([t for t in income_txns if t.status != "DENIED"])
         fee_coverage_pct = round((len(actual_fee_txns) / total_txns) * 100, 1) if total_txns > 0 else 0.0
-        avg_ticket = round(gross_volume / total_txns, 2) if total_txns > 0 else 0.0
+        avg_ticket_dec = (gross_volume_dec / Decimal(valid_income_count)) if valid_income_count > 0 else Decimal("0.00")
 
         # Status breakdown
         status_map: Dict[str, Dict[str, Any]] = {
@@ -81,16 +134,39 @@ class TransactionAnalyticsService:
             "REFUNDED": {"count": 0, "volume": 0.0, "fees": 0.0, "net": 0.0},
             "DISPUTED": {"count": 0, "volume": 0.0, "fees": 0.0, "net": 0.0}
         }
+        cat_map: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"count": 0, "volume": Decimal("0.00"), "expenses": Decimal("0.00")})
 
         for t in transactions:
             st = t.status.upper() if t.status else "COMPLETED"
             if st not in status_map:
                 status_map[st] = {"count": 0, "volume": 0.0, "fees": 0.0, "net": 0.0}
+            amt_usd = convert_to_usd(t.amount, t.currency)
+            eff_fee = t.actual_fee if t.actual_fee is not None else (t.estimated_fee or 0.0)
+            fee_usd = convert_to_usd(eff_fee, t.currency)
+            net_usd = convert_to_usd(t.net_amount or 0.0, t.currency)
+
             status_map[st]["count"] += 1
-            status_map[st]["volume"] = round(status_map[st]["volume"] + t.amount, 2)
-            eff_fee = t.actual_fee if t.actual_fee is not None else t.estimated_fee
-            status_map[st]["fees"] = round(status_map[st]["fees"] + (eff_fee or 0.0), 2)
-            status_map[st]["net"] = round(status_map[st]["net"] + (t.net_amount or 0.0), 2)
+            status_map[st]["volume"] = round(float(to_decimal(status_map[st]["volume"]) + amt_usd), 2)
+            status_map[st]["fees"] = round(float(to_decimal(status_map[st]["fees"]) + fee_usd), 2)
+            status_map[st]["net"] = round(float(to_decimal(status_map[st]["net"]) + net_usd), 2)
+
+            if st != "DENIED":
+                cat = (getattr(t, "category", None) or "Payment").strip()
+                cat_map[cat]["count"] += 1
+                if (getattr(t, "txn_type", None) or "income").lower() == "expense":
+                    cat_map[cat]["expenses"] += amt_usd
+                else:
+                    cat_map[cat]["volume"] += amt_usd
+
+        category_breakdown = [
+            {
+                "category": cat,
+                "count": vals["count"],
+                "incomeVolume": float(quantize_currency(vals["volume"], "USD")),
+                "expenseVolume": float(quantize_currency(vals["expenses"], "USD")),
+            }
+            for cat, vals in sorted(cat_map.items(), key=lambda kv: kv[1]["volume"] + kv[1]["expenses"], reverse=True)
+        ]
 
         # Source breakdown: PayPal Sandbox captures vs Synthetic demonstration records
         source_map = {
@@ -100,7 +176,8 @@ class TransactionAnalyticsService:
         for t in transactions:
             src = t.data_source if t.data_source in source_map else "synthetic"
             source_map[src]["count"] += 1
-            source_map[src]["volume"] = round(source_map[src]["volume"] + t.amount, 2)
+            amt_usd = convert_to_usd(t.amount, t.currency)
+            source_map[src]["volume"] = round(float(to_decimal(source_map[src]["volume"]) + amt_usd), 2)
 
         # Risk metrics
         anomaly_count = sum(1 for t in transactions if t.is_anomaly)
@@ -115,14 +192,18 @@ class TransactionAnalyticsService:
 
         return {
             "totalTransactions": total_txns,
-            "grossPaymentVolume": round(gross_volume, 2),
-            "completedVolume": round(completed_volume, 2),
-            "totalNetReceived": round(total_net, 2),
-            "totalFees": round(total_effective_fees, 2),
-            "totalActualFees": round(total_actual_fees, 2),
-            "totalEstimatedFees": round(total_estimated_fees, 2),
+            "grossPaymentVolume": float(quantize_currency(gross_volume_dec, "USD")),
+            "completedVolume": float(quantize_currency(completed_volume_dec, "USD")),
+            "totalNetReceived": float(quantize_currency(total_net_dec, "USD")),
+            "totalIncome": float(quantize_currency(gross_volume_dec, "USD")),
+            "totalExpenses": float(quantize_currency(total_expenses_dec, "USD")),
+            "netCashFlow": float(quantize_currency(net_cash_flow_dec, "USD")),
+            "totalFees": float(quantize_currency(total_effective_fees_dec, "USD")),
+            "totalActualFees": float(quantize_currency(total_actual_fees_dec, "USD")),
+            "totalEstimatedFees": float(quantize_currency(total_estimated_fees_dec, "USD")),
             "confirmedFeeCoveragePct": fee_coverage_pct,
-            "averageTicketSize": avg_ticket,
+            "averageTicketSize": float(quantize_currency(avg_ticket_dec, "USD")),
+            "categoryBreakdown": category_breakdown,
             "statusBreakdown": status_map,
             "sourceBreakdown": source_map,
             "riskMetrics": {
@@ -136,16 +217,8 @@ class TransactionAnalyticsService:
         }
 
     def _parse_date(self, txn: TransactionModel) -> datetime:
-        """Helper to extract a valid datetime from transaction model, checking date string first"""
-        if txn.date:
-            for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S"):
-                try:
-                    return datetime.strptime(txn.date.strip(), fmt)
-                except ValueError:
-                    continue
-        if txn.created_at:
-            return txn.created_at
-        return datetime.utcnow()
+        """Delegates to unified transaction datetime parser."""
+        return parse_transaction_datetime(txn.date, txn.created_at)
 
     def get_trends(self, db: Session, period: str = "daily", scoped_user_id: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -198,12 +271,15 @@ class TransactionAnalyticsService:
                 key = dt.strftime("%Y-%m")
 
             b = buckets[key]
+            amt_usd = float(convert_to_usd(t.amount, t.currency))
+            fee_usd = float(convert_to_usd(fee, t.currency))
+            net_usd = float(convert_to_usd(t.net_amount or 0.0, t.currency))
             if t.status != "DENIED":
-                b["volume"] += t.amount
+                b["volume"] += amt_usd
             if t.status in ["COMPLETED", "DISPUTED"]:
-                b["fees"] += fee
+                b["fees"] += fee_usd
             if t.status == "COMPLETED":
-                b["net"] += t.net_amount
+                b["net"] += net_usd
                 b["completedCount"] += 1
             elif t.status == "PENDING":
                 b["pendingCount"] += 1
@@ -299,9 +375,8 @@ class TransactionAnalyticsService:
         valid_txns = [t for t in transactions if t.status != "DENIED"]
         total_txns = len(valid_txns)
         
-        # Approximate exchange rates for converting to USD portfolio equivalent
-        RATES_TO_USD = {"USD": 1.0, "EUR": 1.08, "GBP": 1.28, "CAD": 0.74, "AUD": 0.66}
-        total_usd_volume = sum(t.amount * RATES_TO_USD.get((t.currency or "USD").upper(), 1.0) for t in valid_txns)
+        # Exchange rates for converting to USD portfolio equivalent (includes JPY & multi-currency)
+        total_usd_volume = sum(float(convert_to_usd(t.amount, t.currency)) for t in valid_txns)
 
         # 1. Currency distribution
         currency_map = defaultdict(lambda: {"count": 0, "volume": 0.0, "usdVolume": 0.0, "actualFees": 0.0})
@@ -310,7 +385,7 @@ class TransactionAnalyticsService:
             c_entry = currency_map[curr]
             c_entry["count"] += 1
             c_entry["volume"] += t.amount
-            c_entry["usdVolume"] += t.amount * RATES_TO_USD.get(curr, 1.0)
+            c_entry["usdVolume"] += float(convert_to_usd(t.amount, curr))
             fee = t.actual_fee if t.actual_fee is not None else (t.estimated_fee or 0.0)
             c_entry["actualFees"] += fee
 
@@ -332,12 +407,11 @@ class TransactionAnalyticsService:
         for t in valid_txns:
             method = t.payment_method or "PayPal Wallet"
             rail_map[method]["count"] += 1
-            rail_map[method]["volume"] += t.amount
+            rail_map[method]["volume"] += float(convert_to_usd(t.amount, t.currency))
 
         rail_dist = []
-        raw_valid_volume = sum(t.amount for t in valid_txns)
         for method, data in rail_map.items():
-            pct = round((data["volume"] / raw_valid_volume) * 100, 1) if raw_valid_volume > 0 else 0.0
+            pct = round((data["volume"] / total_usd_volume) * 100, 1) if total_usd_volume > 0 else 0.0
             rail_dist.append({
                 "method": method,
                 "count": data["count"],
@@ -346,7 +420,7 @@ class TransactionAnalyticsService:
             })
         rail_dist.sort(key=lambda x: x["volume"], reverse=True)
 
-        # 3. Ticket size brackets
+        # 3. Ticket size brackets (FX-normalized to USD portfolio equivalent)
         brackets_def = [
             {"bracket": "Micropayments (< $20)", "min": 0.0, "max": 20.0, "micropayEligible": True},
             {"bracket": "Small Basket ($20 - $100)", "min": 20.0, "max": 100.0, "micropayEligible": False},
@@ -357,9 +431,9 @@ class TransactionAnalyticsService:
 
         ticket_brackets = []
         for b in brackets_def:
-            matched = [t for t in valid_txns if b["min"] <= t.amount < b["max"]]
-            matched_vol = sum(t.amount for t in matched)
-            pct = round((matched_vol / raw_valid_volume) * 100, 1) if raw_valid_volume > 0 else 0.0
+            matched = [t for t in valid_txns if b["min"] <= float(convert_to_usd(t.amount, t.currency)) < b["max"]]
+            matched_vol = sum(float(convert_to_usd(t.amount, t.currency)) for t in matched)
+            pct = round((matched_vol / total_usd_volume) * 100, 1) if total_usd_volume > 0 else 0.0
             ticket_brackets.append({
                 "bracket": b["bracket"],
                 "count": len(matched),
@@ -369,27 +443,30 @@ class TransactionAnalyticsService:
             })
 
         # 4. Geographic distribution (Domestic US vs Cross-Border)
-        domestic_vol = sum(t.amount for t in valid_txns if (t.country or "").lower() in ["united states", "us", "usa"])
-        inter_vol = max(0.0, raw_valid_volume - domestic_vol)
-        inter_pct = round((inter_vol / raw_valid_volume) * 100, 1) if raw_valid_volume > 0 else 0.0
+        domestic_vol = sum(float(convert_to_usd(t.amount, t.currency)) for t in valid_txns if is_domestic_us(t.country))
+        usd_valid_volume = sum(float(convert_to_usd(t.amount, t.currency)) for t in valid_txns)
+        inter_vol = max(0.0, usd_valid_volume - domestic_vol)
+        inter_pct = round((inter_vol / usd_valid_volume) * 100, 1) if usd_valid_volume > 0 else 0.0
 
-        # 5. Outlier detection (> 2.5 std deviations above mean)
-        amounts = [t.amount for t in transactions if t.amount > 0]
-        mean_amt = float(np.mean(amounts)) if amounts else 0.0
-        std_amt = float(np.std(amounts)) if len(amounts) > 1 else 0.0
+        # 5. Outlier detection (> 2.5 std deviations above USD-normalized mean)
+        amounts_usd = [float(convert_to_usd(t.amount, t.currency)) for t in transactions if t.amount > 0]
+        mean_amt = float(np.mean(amounts_usd)) if amounts_usd else 0.0
+        std_amt = float(np.std(amounts_usd)) if len(amounts_usd) > 1 else 0.0
         threshold = mean_amt + (2.5 * std_amt)
 
         outliers = []
         for t in transactions:
-            if t.amount > threshold and t.amount > 1500.0:
+            usd_amt = float(convert_to_usd(t.amount, t.currency))
+            if usd_amt > threshold and usd_amt > 1500.0:
                 outliers.append({
                     "id": t.id,
                     "paypalOrderId": t.paypal_order_id,
                     "amount": t.amount,
+                    "usdAmount": round(usd_amt, 2),
                     "currency": t.currency,
                     "status": t.status,
                     "customer": t.customer_name,
-                    "reason": f"Amount is ${(t.amount - mean_amt):.2f} above standard mean ($ {mean_amt:.2f})"
+                    "reason": f"USD equivalent (${usd_amt:,.2f}) is ${(usd_amt - mean_amt):.2f} above standard mean ($ {mean_amt:.2f})"
                 })
 
         return {
@@ -452,7 +529,7 @@ class TransactionAnalyticsService:
         currencies = patterns["currencyDistribution"]
         non_usd = [c for c in currencies if c["currency"] != "USD"]
         if non_usd:
-            non_usd_vol = sum(c["volume"] for c in non_usd)
+            non_usd_vol = sum(c.get("usdEquivalent", c["volume"]) for c in non_usd)
             total_vol = summary["grossPaymentVolume"]
             non_usd_pct = round((non_usd_vol / total_vol) * 100, 1) if total_vol > 0 else 0.0
             spread_loss_est = round(non_usd_vol * 0.035, 2)

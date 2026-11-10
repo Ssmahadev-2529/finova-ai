@@ -8,6 +8,7 @@ Provides:
 """
 
 from typing import List, Dict, Any, Optional, Tuple
+from decimal import Decimal
 from datetime import datetime, timedelta
 from collections import defaultdict
 import numpy as np
@@ -16,22 +17,16 @@ from models.transaction import TransactionModel
 from services.analytics_service import analytics_service
 from services.auth_service import scope_transaction_query
 from services.cost_optimizer_service import cost_optimizer_service, PAYPAL_BASE_PERCENTAGES, PAYPAL_FIXED_FEES
+from services.shared_utils import convert_to_usd, parse_transaction_datetime, quantize_currency
+
 
 class DecisionIntelligenceService:
     def __init__(self):
         pass
 
     def _parse_date(self, txn: TransactionModel) -> datetime:
-        """Parses transaction date safely from string or created_at."""
-        if txn.date:
-            for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S"):
-                try:
-                    return datetime.strptime(txn.date.strip(), fmt)
-                except ValueError:
-                    continue
-        if txn.created_at:
-            return txn.created_at
-        return datetime.utcnow()
+        """Delegates to unified transaction datetime parser."""
+        return parse_transaction_datetime(txn.date, txn.created_at)
 
     def get_period_comparison(self, db: Session, period: str = "monthly", scoped_user_id: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -94,7 +89,7 @@ class DecisionIntelligenceService:
         elif len(sorted_keys) == 1:
             current_key = sorted_keys[0]
             prev_key = "Previous Baseline"
-            all_txns = buckets[current_key]
+            all_txns = sorted(buckets[current_key], key=self._parse_date)
             # Split chronologically
             mid = max(1, len(all_txns) // 2)
             curr_txns = all_txns[mid:]
@@ -106,28 +101,41 @@ class DecisionIntelligenceService:
             prev_key = "Previous"
 
         def _calc_period_stats(txns_list: List[TransactionModel]) -> Dict[str, float]:
-            if not txns_list:
+            income_txns = [t for t in txns_list if (getattr(t, "txn_type", None) or "income").lower() != "expense"]
+            if not income_txns:
                 return {
                     "gross": 0.0, "net": 0.0, "fees": 0.0, "refunds": 0.0,
                     "successRate": 100.0, "failureRate": 0.0, "avgTicket": 0.0, "count": 0
                 }
-            n = len(txns_list)
-            gross = sum(t.amount for t in txns_list if t.status != "DENIED")
-            completed = [t for t in txns_list if t.status == "COMPLETED"]
-            net = sum(t.net_amount for t in completed)
-            fees = sum(t.actual_fee if t.actual_fee is not None else (t.estimated_fee or 0.0) for t in txns_list if t.status in ["COMPLETED", "DISPUTED"])
-            refunds = sum(t.amount for t in txns_list if t.status == "REFUNDED")
-            denied = [t for t in txns_list if t.status in ["DENIED", "FAILED"]]
+            n = len(income_txns)
+            valid_income = [t for t in income_txns if t.status != "DENIED"]
+            gross_dec = sum((convert_to_usd(t.amount, t.currency) for t in valid_income), Decimal("0.00"))
+            completed = [t for t in income_txns if t.status == "COMPLETED"]
+            net_dec = sum((convert_to_usd(t.net_amount or 0.0, t.currency) for t in completed), Decimal("0.00"))
+            fees_dec = sum(
+                (
+                    convert_to_usd(t.actual_fee if t.actual_fee is not None else (t.estimated_fee or 0.0), t.currency)
+                    for t in income_txns
+                    if t.status in ["COMPLETED", "DISPUTED"]
+                ),
+                Decimal("0.00"),
+            )
+            refunds_dec = sum(
+                (convert_to_usd(t.amount, t.currency) for t in income_txns if t.status == "REFUNDED"),
+                Decimal("0.00"),
+            )
+            denied = [t for t in income_txns if t.status in ["DENIED", "FAILED"]]
 
             success_rate = round((len(completed) / n) * 100, 2)
             failure_rate = round((len(denied) / n) * 100, 2)
-            avg_ticket = round(gross / max(1, len([t for t in txns_list if t.status != "DENIED"])), 2)
+            gross_f = float(quantize_currency(gross_dec, "USD"))
+            avg_ticket = round(gross_f / max(1, len(valid_income)), 2) if valid_income else 0.0
 
             return {
-                "gross": round(gross, 2),
-                "net": round(net, 2),
-                "fees": round(fees, 2),
-                "refunds": round(refunds, 2),
+                "gross": gross_f,
+                "net": float(quantize_currency(net_dec, "USD")),
+                "fees": float(quantize_currency(fees_dec, "USD")),
+                "refunds": float(quantize_currency(refunds_dec, "USD")),
                 "successRate": success_rate,
                 "failureRate": failure_rate,
                 "avgTicket": avg_ticket,
@@ -213,7 +221,7 @@ class DecisionIntelligenceService:
                 "periodLabel": d.get("day") or d.get("week") or d.get("month") or d.get("date") or "Actual",
                 "volume": vol,
                 "fees": float(d.get("fee", 0.0)),
-                "net": float(d.get("netAmount", 0.0)),
+                "net": float(d.get("net", d.get("netAmount", 0.0))),
                 "isForecast": False,
                 "lowerConfidence": vol,
                 "upperConfidence": vol
@@ -222,8 +230,8 @@ class DecisionIntelligenceService:
         n = len(historical_points)
         volumes = [p["volume"] for p in historical_points]
         total_vol = sum(volumes)
-        avg_vol = float(np.mean(volumes)) if volumes else 1000.0
-        effective_rate = 0.0253 # Default 2.53% commercial rate
+        avg_vol = float(np.mean(volumes)) if volumes else 0.0
+        effective_rate = 0.0349 # Standard PayPal commercial rate when no historical fees exist
 
         if n > 0 and total_vol > 0:
             total_fees = sum(p["fees"] for p in historical_points)
@@ -234,7 +242,10 @@ class DecisionIntelligenceService:
         confidence_level = 85
         seasonal_detected = False
 
-        if n < 5:
+        if n == 0:
+            algorithm_used = "Insufficient History (N = 0 — No Forecast Generated)"
+            confidence_level = 0
+        elif n < 5:
             # Fallback for insufficient data points
             algorithm_used = "Flat Baseline Statistical Fallback (N < 5)"
             confidence_level = 60
@@ -345,16 +356,18 @@ class DecisionIntelligenceService:
         dispute_rate = summary.get("riskMetrics", {}).get("disputeRate", 0.0)
         refund_rate = summary.get("riskMetrics", {}).get("refundRate", 0.0)
 
-        # 1. Processing Cost Creep / Fee Rate Analysis
-        if effective_rate > 3.0:
+        # 1. Processing Cost Creep / Fee Rate Analysis (computed from real ledger metrics)
+        if effective_rate > 3.0 and gross_volume > 0:
+            excess_rate = max(0.0, effective_rate - 2.99)
+            est_excess_usd = round(gross_volume * (excess_rate / 100.0), 2)
             decisions.append({
                 "id": "DEC-COST-01",
                 "title": "Payment Fee Rate Creep Detected",
                 "category": "cost_control",
                 "severity": "warning",
-                "observation": f"Effective transaction fee rate is currently {effective_rate}%, which exceeds PayPal's standard domestic commercial baseline of 3.49% due to fixed charges and cross-border adjustments.",
+                "observation": f"Effective transaction fee rate is currently {effective_rate}%, which exceeds PayPal's standard domestic baseline due to fixed charges and cross-border adjustments.",
                 "supportingData": f"Total fees paid: ${total_fees:,.2f} USD on ${gross_volume:,.2f} USD gross volume across {total_txns} orders.",
-                "financialImpact": "Estimated excess fee leakage: $140.00 – $280.00 USD / month.",
+                "financialImpact": f"Measured fee excess above 2.99% baseline: ${est_excess_usd:,.2f} USD across recorded ledger.",
                 "recommendedAction": "Apply for PayPal Micropayments tier (5% + $0.05) on transactions below $12.00 to reduce the impact of the fixed $0.49 commercial fee.",
                 "confidence": 92,
                 "limitations": "Assumes current order size distribution remains consistent."
@@ -379,14 +392,16 @@ class DecisionIntelligenceService:
         geo_dist = patterns.get("geographicDistribution", {})
         inter_pct = geo_dist.get("internationalPct", 0.0)
         if inter_pct > 25.0:
+            intl_vol = float(geo_dist.get("internationalVolume", 0.0))
+            est_fx_drag = round(intl_vol * 0.035, 2)
             decisions.append({
                 "id": "DEC-CURR-03",
                 "title": "Substantial Cross-Border Currency Exposure",
                 "category": "currency_strategy",
                 "severity": "info",
-                "observation": f"{inter_pct}% of total transaction volume originates from cross-border international buyers (EUR, GBP).",
-                "supportingData": f"Foreign sales volume: ${geo_dist.get('internationalVolume', 0.0):,.2f} USD incurring ~1.50% cross-border surcharge and 3.50% conversion spreads.",
-                "financialImpact": "Estimated monthly foreign exchange loss: $190.00 – $320.00 USD.",
+                "observation": f"{inter_pct}% of total transaction volume originates from cross-border international buyers.",
+                "supportingData": f"Foreign sales volume: ${intl_vol:,.2f} USD incurring ~1.50% cross-border surcharge and ~3.50% conversion spreads.",
+                "financialImpact": f"Estimated foreign exchange conversion spread on recorded international volume: ${est_fx_drag:,.2f} USD.",
                 "recommendedAction": "Configure native EUR and GBP holding balances inside your PayPal Business account to settle foreign payments without automatic conversion to USD.",
                 "confidence": 94,
                 "limitations": "Applies to transactions processed through international payment cards."
@@ -444,33 +459,44 @@ class DecisionIntelligenceService:
         Returns detailed projected metrics and savings/cost delta.
         """
         summary = analytics_service.get_summary(db, scoped_user_id=scoped_user_id)
+        patterns = analytics_service.get_patterns_and_distribution(db, scoped_user_id=scoped_user_id)
 
-        base_gross = float(summary.get("grossPaymentVolume", 15349.0))
-        base_fees = float(summary.get("totalFees", 388.02))
-        base_net = float(summary.get("totalNetReceived", 14960.98))
-        base_txns = int(summary.get("totalTransactions", 13))
-        base_avg_ticket = float(summary.get("averageTicketSize", 1180.69))
-        base_effective_rate = round((base_fees / max(1.0, base_gross)) * 100, 2)
+        base_gross = float(summary.get("grossPaymentVolume", 0.0))
+        base_fees = float(summary.get("totalFees", 0.0))
+        base_net = float(summary.get("totalNetReceived", 0.0))
+        base_txns = int(summary.get("totalTransactions", 0))
+        base_avg_ticket = float(summary.get("averageTicketSize", 0.0))
+        base_effective_rate = round((base_fees / base_gross) * 100, 2) if base_gross > 0 else 0.0
+        actual_cb_pct = float(patterns.get("geographicDistribution", {}).get("internationalPct", 0.0)) / 100.0
 
         # Apply volume growth
         sim_gross = round(base_gross * (1.0 + (volume_growth_pct / 100.0)), 2)
         sim_avg_ticket = target_avg_ticket if target_avg_ticket and target_avg_ticket > 0 else base_avg_ticket
-        sim_txn_count = max(1, int(round(sim_gross / max(1.0, sim_avg_ticket))))
+        sim_txn_count = 0 if sim_gross <= 0 else max(1, int(round(sim_gross / max(1.0, sim_avg_ticket))))
 
         # Apply fee schedule
         tier = payment_tier.lower().strip()
-        tier_pct = PAYPAL_BASE_PERCENTAGES.get(tier, 3.49) / 100.0
-        tier_fixed = PAYPAL_FIXED_FEES.get("USD", {}).get(tier, 0.49)
+        usd_fixed_map = PAYPAL_FIXED_FEES.get("USD", {})
+        if tier == "qr_code":
+            if sim_avg_ticket <= 10.0:
+                tier_pct = 2.40 / 100.0
+                tier_fixed = usd_fixed_map.get("qr_code_small", 0.05)
+            else:
+                tier_pct = 1.90 / 100.0
+                tier_fixed = usd_fixed_map.get("qr_code_large", 0.10)
+        else:
+            tier_pct = PAYPAL_BASE_PERCENTAGES.get(tier, 3.49) / 100.0
+            tier_fixed = usd_fixed_map.get(tier, 0.49)
 
-        # Cross border fee adjustment
-        cb_pct = (cross_border_pct / 100.0) if cross_border_pct is not None else 0.444
+        # Cross border fee adjustment (defaults to merchant's real observed international share)
+        cb_pct = (cross_border_pct / 100.0) if cross_border_pct is not None else actual_cb_pct
         cb_surcharge = 0.015 * cb_pct # +1.50% on cross-border share
 
         sim_var_fees = sim_gross * (tier_pct + cb_surcharge)
         sim_fixed_fees = sim_txn_count * tier_fixed
         sim_total_fees = round(sim_var_fees + sim_fixed_fees, 2)
         sim_net = round(sim_gross - sim_total_fees, 2)
-        sim_effective_rate = round((sim_total_fees / max(1.0, sim_gross)) * 100, 2)
+        sim_effective_rate = round((sim_total_fees / sim_gross) * 100, 2) if sim_gross > 0 else 0.0
 
         # Variance vs baseline
         volume_delta = round(sim_gross - base_gross, 2)

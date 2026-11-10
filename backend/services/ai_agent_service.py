@@ -8,20 +8,66 @@ and scam shield logs to provide grounded, hallucination-free answers.
 """
 
 import httpx
+import logging
+import math
 import re
+import time
+import uuid
+from collections import Counter
 from typing import List, Dict, Any, Optional
 from sqlalchemy.orm import Session
 from models.transaction import TransactionModel, ScamAuditModel
+from models.finance import BudgetModel, AIUsageLogModel
+from models.user import UserModel
 from services.analytics_service import analytics_service
 from services.auth_service import scope_transaction_query, scope_scam_audit_query
 from services.cost_optimizer_service import cost_optimizer_service
 from services.anomaly_service import anomaly_service
 from services.scam_shield_service import scam_shield_service
+from services.shared_utils import redact_sensitive_text, convert_to_usd
 from config import settings
+
+logger = logging.getLogger("finova.ai")
+
+PAYPAL_KNOWLEDGE_CHUNKS = [
+    {
+        "source": "policy:paypal-commercial-pricing",
+        "text": "PayPal US standard commercial rate is 3.49% plus $0.49 USD fixed fee; international cross-border transactions add +1.50% surcharge.",
+    },
+    {
+        "source": "policy:paypal-micropayments",
+        "text": "PayPal Micropayments schedule is 5.00% plus $0.05 USD fixed fee, reducing processing fees on orders under $12.00 USD.",
+    },
+    {
+        "source": "policy:paypal-fx-balances",
+        "text": "Holding native EUR or GBP balances in a PayPal Business account helps avoid ~3.50% automatic foreign currency conversion spreads.",
+    },
+    {
+        "source": "policy:paypal-seller-protection",
+        "text": "Uploading carrier tracking within 24 hours and requiring signature confirmation on orders >= $750 protects merchants under PayPal Seller Protection against Item Not Received and Unauthorized disputes.",
+    },
+]
 
 class AIAgentService:
     def __init__(self):
+        self._initial_api_key = settings.GEMINI_API_KEY
         self.api_key = settings.GEMINI_API_KEY
+
+    def _resolve_api_key(self) -> str:
+        """Resolves runtime GEMINI_API_KEY cleanly while respecting test overrides of self.api_key."""
+        if self.api_key and self.api_key != self._initial_api_key:
+            return self.api_key.strip()
+        return (settings.GEMINI_API_KEY or self.api_key or "").strip()
+
+    def _sanitize_untrusted_field(self, value: Any, max_len: int = 120) -> str:
+        """Sanitizes untrusted DB strings before embedding into LLM prompt/RAG context."""
+        if value is None:
+            return ""
+        raw = str(value).replace("\r", " ").replace("\n", " ").strip()
+        cleaned, blocked, _ = self.sanitize_input(raw)
+        if blocked:
+            return "[REDACTED_UNTRUSTED_TEXT]"
+        return redact_sensitive_text(cleaned)[:max_len]
 
     def sanitize_input(self, query: str) -> tuple[str, bool, str]:
         """
@@ -54,12 +100,108 @@ class AIAgentService:
             if re.search(pat, lower):
                 return clean, True, "Prompt injection or unauthorized execution signature detected."
 
-        # Redact sensitive credit card patterns (13-19 digits)
-        clean = re.sub(r"\b(?:\d{4}[ -]?){3}\d{4}\b", "[REDACTED_CARD_NUMBER]", clean)
-        # Redact candidate token/secret patterns (32+ hex/base64 chars)
+        # Redact Luhn-valid card PANs & sensitive tokens via shared utility
+        clean = redact_sensitive_text(clean)
         clean = re.sub(r"\b(?:Bearer\s+)?[A-Za-z0-9_-]{32,}\b", "[REDACTED_TOKEN]", clean)
 
         return clean, False, ""
+
+    def _tokenize(self, text: str) -> List[str]:
+        return re.findall(r"[a-z0-9_.-]{2,}", (text or "").lower())
+
+    def _retrieve_relevant_chunks(
+        self,
+        query: str,
+        txns_dict: List[Dict[str, Any]],
+        scam_logs: List[Any],
+        budgets: List[Any],
+        summary: Dict[str, Any],
+        top_k: int = 6,
+    ) -> List[Dict[str, Any]]:
+        """
+        Tenant-scoped hybrid lexical/TF-IDF cosine retriever over verified merchant records,
+        budgets, scam audit logs, and PayPal merchant policy knowledge snippets.
+        """
+        corpus: List[Dict[str, str]] = [
+            {
+                "source": "ledger:summary",
+                "text": (
+                    f"Merchant ledger summary: {summary.get('totalTransactions', 0)} transactions, "
+                    f"gross ${summary.get('grossPaymentVolume', 0.0):.2f} USD, "
+                    f"net ${summary.get('totalNetReceived', 0.0):.2f} USD, "
+                    f"fees ${summary.get('totalFees', 0.0):.2f} USD, "
+                    f"expenses ${summary.get('totalExpenses', 0.0):.2f} USD."
+                ),
+            }
+        ]
+        for txn in txns_dict[:25]:
+            fee_val = txn.get("actualFee") if txn.get("actualFee") is not None else (txn.get("estimatedFee") or 0.0)
+            c_name = self._sanitize_untrusted_field(txn.get("customerName"), 64)
+            cat_val = self._sanitize_untrusted_field(txn.get("category", "Payment"), 48)
+            ctry_val = self._sanitize_untrusted_field(txn.get("country"), 48)
+            reason_val = self._sanitize_untrusted_field(txn.get("anomalyReason"), 140)
+            corpus.append(
+                {
+                    "source": f"txn:{txn.get('id')}",
+                    "text": (
+                        f"Transaction {txn.get('id')} ({txn.get('status')}) customer {c_name} "
+                        f"amount {txn.get('amount')} {txn.get('currency')} fee {fee_val} net {txn.get('netAmount')} "
+                        f"category {cat_val} type {txn.get('txnType', 'income')} "
+                        f"country {ctry_val} risk {txn.get('riskLevel')} {reason_val}"
+                    ),
+                }
+            )
+        for b in budgets[:10]:
+            safe_cat = self._sanitize_untrusted_field(b.category, 64)
+            corpus.append(
+                {
+                    "source": f"budget:{safe_cat}",
+                    "text": f"Budget category {safe_cat} limit {float(b.limit_amount):.2f} {b.currency} period {b.period}",
+                }
+            )
+        for s in scam_logs[:5]:
+            corpus.append(
+                {
+                    "source": f"scam:{s.id}",
+                    "text": f"Scam shield audit {s.id} type {s.target_type} risk {s.risk_level} score {s.risk_score}/100",
+                }
+            )
+        corpus.extend(PAYPAL_KNOWLEDGE_CHUNKS)
+
+        q_tokens = self._tokenize(query)
+        if not q_tokens:
+            return [{"source": c["source"], "text": c["text"], "score": 1.0} for c in corpus[:top_k]]
+
+        doc_tokens_list = [self._tokenize(c["text"]) for c in corpus]
+        df: Counter = Counter()
+        for toks in doc_tokens_list:
+            for tok in set(toks):
+                df[tok] += 1
+        n_docs = len(corpus)
+
+        def _tfidf_vec(toks: List[str]) -> Dict[str, float]:
+            tf = Counter(toks)
+            total = max(1, len(toks))
+            return {
+                tok: (cnt / total) * (math.log((n_docs + 1) / (df[tok] + 1)) + 1.0)
+                for tok, cnt in tf.items()
+            }
+
+        q_vec = _tfidf_vec(q_tokens)
+        q_norm = math.sqrt(sum(v * v for v in q_vec.values())) or 1.0
+
+        scored = []
+        for idx, doc in enumerate(corpus):
+            d_vec = _tfidf_vec(doc_tokens_list[idx])
+            d_norm = math.sqrt(sum(v * v for v in d_vec.values())) or 1.0
+            dot = sum(q_vec[t] * d_vec[t] for t in q_vec if t in d_vec)
+            cos = dot / (q_norm * d_norm)
+            if doc["source"] == "ledger:summary":
+                cos += 0.15
+            scored.append({"source": doc["source"], "text": doc["text"], "score": round(cos, 4)})
+
+        scored.sort(key=lambda item: item["score"], reverse=True)
+        return scored[:top_k]
 
     def handle_financial_query(
         self,
@@ -69,14 +211,10 @@ class AIAgentService:
         scoped_user_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Main entry point for financial assistant inquiries.
-        1. Sanitizes user input against prompt injection and sensitive data leakage.
-        2. Retrieves ground-truth records from database.
-        3. Computes deterministic financial figures (totals, fees, anomalies, declines).
-        4. Classifies intent and generates evidence-based answers.
-        5. Synthesizes structured financial summary cards and follow-up prompts.
+        Main entry point for financial assistant inquiries with tenant-scoped RAG,
+        prompt-injection protection, deterministic ledger grounding, and usage telemetry.
         """
-        # Security sanitization
+        start_ts = time.perf_counter()
         sanitized_query, is_injection, injection_reason = self.sanitize_input(query)
         if is_injection:
             return {
@@ -105,21 +243,23 @@ class AIAgentService:
             }
 
         clean_q = sanitized_query
-        # Ground-truth retrieval strictly scoped to authenticated tenant
         txn_query = scope_transaction_query(db.query(TransactionModel), TransactionModel, scoped_user_id)
         transactions = txn_query.order_by(TransactionModel.created_at.desc()).all()
         txns_dict = [t.to_dict() for t in transactions]
         scam_query = scope_scam_audit_query(db.query(ScamAuditModel), ScamAuditModel, scoped_user_id)
         scam_logs = scam_query.order_by(ScamAuditModel.created_at.desc()).limit(5).all()
+        budgets = (
+            db.query(BudgetModel).filter(BudgetModel.user_id == scoped_user_id).all()
+            if scoped_user_id
+            else []
+        )
 
-        # Compute deterministic summaries
         summary = analytics_service.get_summary(db, scoped_user_id=scoped_user_id)
         health = anomaly_service.calculate_account_health(txns_dict)
         cost_analysis = cost_optimizer_service.get_historical_analysis(db, scoped_user_id=scoped_user_id)
-        anomalies = anomaly_service.detect_anomalies(txns_dict)
+        anomalies = health.get("detectedAnomalies") or []
         scam_dist = scam_shield_service.get_threat_distribution(db, scoped_user_id=scoped_user_id)
 
-        # Pre-calculated deterministic facts
         completed_txns = [t for t in txns_dict if str(t.get("status", "")).upper() == "COMPLETED"]
         denied_txns = [t for t in txns_dict if str(t.get("status", "")).upper() in ["DENIED", "FAILED"]]
         refunded_txns = [t for t in txns_dict if str(t.get("status", "")).upper() == "REFUNDED"]
@@ -130,14 +270,24 @@ class AIAgentService:
         total_fees = float(summary.get("totalFees", 0.0))
         net_received = float(summary.get("totalNetReceived", 0.0))
         avg_ticket = float(summary.get("averageTicketSize", 0.0))
-        effective_rate = round((total_fees / max(1.0, gross_volume)) * 100, 2)
+        effective_rate = round((total_fees / gross_volume) * 100, 2) if gross_volume > 0 else 0.0
 
-        # Identify transaction with highest fee
-        txns_with_fees = [t for t in txns_dict if (t.get("actualFee") or t.get("estimatedFee") or 0.0) > 0.0]
+        txns_with_fees = [
+            t for t in txns_dict
+            if (t.get("actualFee") if t.get("actualFee") is not None else (t.get("estimatedFee") or 0.0)) > 0.0
+        ]
         highest_fee_txn = max(
             txns_with_fees,
-            key=lambda t: float(t.get("actualFee") or t.get("estimatedFee") or 0.0),
+            key=lambda t: float(t.get("actualFee") if t.get("actualFee") is not None else (t.get("estimatedFee") or 0.0)),
             default=None
+        )
+
+        retrieved_chunks = self._retrieve_relevant_chunks(
+            query=clean_q,
+            txns_dict=txns_dict,
+            scam_logs=scam_logs,
+            budgets=budgets,
+            summary=summary,
         )
 
         # Intent classification
@@ -167,9 +317,12 @@ class AIAgentService:
             txns_dict=txns_dict
         )
 
-        # If Gemini API key is configured and valid, enrich explanation while preserving factual numbers
-        if self.api_key and self.api_key.strip() and self.api_key.startswith("AIza") and "your_gemini" not in self.api_key:
-            gemini_reply = self._call_gemini_with_context(
+        effective_api_key = self._resolve_api_key()
+        used_gemini = False
+        used_fallback = False
+        prompt_chars = len(clean_q)
+        if effective_api_key and effective_api_key.startswith("AIza") and "your_gemini" not in effective_api_key:
+            gemini_reply, used_gemini, prompt_chars = self._call_gemini_with_context_detailed(
                 query=clean_q,
                 facts_context={
                     "gross_volume": gross_volume,
@@ -182,22 +335,58 @@ class AIAgentService:
                     "anomalies_count": len(anomalies),
                     "health_score": health.get("healthScore"),
                     "health_tier": health.get("healthTier"),
-                    "dispute_rate": health.get("disputeRate")
+                    "dispute_rate": health.get("disputeRate"),
+                    "retrieved_chunks": retrieved_chunks,
+                    "scam_logs": [s.to_dict() for s in scam_logs],
                 },
-                history=history
+                history=history,
+                api_key=effective_api_key,
             )
             if gemini_reply:
-                response_payload["reply"] = gemini_reply
+                response_payload["reply"] = (
+                    gemini_reply
+                    + "\n\n---\n*Note: Verified dollar figures reflect your database ledger; AI commentary is advisory only and does not guarantee future financial outcomes.*"
+                )
+            else:
+                used_fallback = True
 
+        elapsed_ms = int((time.perf_counter() - start_ts) * 1000)
         response_payload["intent"] = intent
         response_payload["category"] = category
+        response_payload["groundingSource"] = "gemini+rag" if used_gemini else "deterministic-rag"
+        response_payload["retrievedSources"] = [c["source"] for c in retrieved_chunks]
         response_payload["context"] = {
             "transactionsExamined": len(txns_dict),
             "accountHealthScore": health.get("healthScore", 88),
             "totalVolume": gross_volume,
             "totalFees": total_fees,
-            "netAmount": net_received
+            "netAmount": net_received,
+            "contextChunks": len(retrieved_chunks),
+            "provider": "gemini" if used_gemini else "deterministic",
         }
+
+        try:
+            persisted_uid = None
+            if scoped_user_id and db.query(UserModel.id).filter(UserModel.id == scoped_user_id).first():
+                persisted_uid = scoped_user_id
+            db.add(
+                AIUsageLogModel(
+                    id=f"AIU-{uuid.uuid4().hex[:10].upper()}",
+                    user_id=persisted_uid,
+                    intent=intent,
+                    provider="gemini" if used_gemini else "deterministic",
+                    model_name="gemini-1.5-flash" if used_gemini else "deterministic-rag-v1",
+                    latency_ms=elapsed_ms,
+                    prompt_chars=prompt_chars,
+                    response_chars=len(response_payload.get("reply", "")),
+                    context_chunks=len(retrieved_chunks),
+                    used_fallback=used_fallback,
+                )
+            )
+            db.commit()
+        except Exception as telemetry_exc:
+            db.rollback()
+            logger.debug("AI usage log skipped (%s)", type(telemetry_exc).__name__)
 
         return response_payload
 
@@ -238,11 +427,7 @@ class AIAgentService:
         if any(k in text for k in ["unusual", "anomaly", "anomalies", "suspicious", "flagged", "outlier", "risk check"]):
             return "UNUSUAL_ACTIVITY", "fraud_check"
 
-        # 7. How to reduce payment-processing costs
-        if any(k in text for k in ["reduce", "lower fee", "save money", "optimize fee", "cut cost", "cost reduction", "cheaper"]):
-            return "COST_REDUCTION", "cost_reduction"
-
-        # 8. Financial performance summary
+        # 7. Financial performance summary
         if any(k in text for k in ["summarize", "performance", "monthly summary", "overview", "executive summary", "financial performance"]):
             return "PERFORMANCE_SUMMARY", "performance_summary"
 
@@ -311,9 +496,10 @@ class AIAgentService:
             ]
 
         elif intent == "FEE_AUDIT":
-            actual_fees = cost_analysis.get("actualFeesCaptured", total_fees)
-            estimated_fees = cost_analysis.get("estimatedFeesTotal", total_fees)
-            variance = cost_analysis.get("varianceAmount", 0.0)
+            recon = cost_analysis.get("reconciliation") or {}
+            actual_fees = recon.get("totalActualFees", cost_analysis.get("actualFeesCaptured", total_fees))
+            estimated_fees = recon.get("totalEstimatedFees", cost_analysis.get("estimatedFeesTotal", total_fees))
+            variance = recon.get("variance", cost_analysis.get("varianceAmount", 0.0))
 
             reply = (
                 f"### 💳 Transaction Fee Audit\n\n"
@@ -347,30 +533,38 @@ class AIAgentService:
                 h_id = highest_fee_txn.get("id")
                 h_amt = float(highest_fee_txn.get("amount", 0.0))
                 h_curr = highest_fee_txn.get("currency", "USD")
-                h_fee = float(highest_fee_txn.get("actualFee") or highest_fee_txn.get("estimatedFee") or 0.0)
+                h_fee = float(
+                    highest_fee_txn.get("actualFee")
+                    if highest_fee_txn.get("actualFee") is not None
+                    else (highest_fee_txn.get("estimatedFee") or 0.0)
+                )
                 h_status = highest_fee_txn.get("status")
                 h_customer = highest_fee_txn.get("customerName", "Customer")
                 h_country = highest_fee_txn.get("country", "United States")
                 h_pct = round((h_fee / max(1.0, h_amt)) * 100, 2)
 
+                amt_str = f"${h_amt:,.2f} USD" if h_curr == "USD" else (f"¥{h_amt:,.0f} JPY" if h_curr == "JPY" else f"{h_amt:,.2f} {h_curr}")
+                fee_str = f"${h_fee:,.2f} USD" if h_curr == "USD" else (f"¥{h_fee:,.0f} JPY" if h_curr == "JPY" else f"{h_fee:,.2f} {h_curr}")
+                net_val = float(highest_fee_txn.get('netAmount', 0.0))
+                net_str = f"${net_val:,.2f} USD" if h_curr == "USD" else (f"¥{net_val:,.0f} JPY" if h_curr == "JPY" else f"{net_val:,.2f} {h_curr}")
                 reply = (
                     f"### 🏆 Highest Fee Transaction: {h_id}\n\n"
                     f"The transaction with the highest processing fee is **{h_id}**:\n"
                     f"- **Customer:** {h_customer} ({h_country})\n"
-                    f"- **Order Amount:** **${h_amt:,.2f} {h_curr}**\n"
-                    f"- **Transaction Fee:** **${h_fee:,.2f} {h_curr}** ({h_pct}% of order value)\n"
-                    f"- **Net Settled:** **${float(highest_fee_txn.get('netAmount', 0.0)):,.2f} {h_curr}**\n"
+                    f"- **Order Amount:** **{amt_str}**\n"
+                    f"- **Transaction Fee:** **{fee_str}** ({h_pct}% of order value)\n"
+                    f"- **Net Settled:** **{net_str}**\n"
                     f"- **Status:** **{h_status}**\n\n"
                     f"**Why the fee was elevated:**\n"
-                    f"At a transaction value of ${h_amt:,.2f}, the variable percentage fee (`3.49% = ${(h_amt * 0.0349):,.2f}`) plus cross-border or fixed charges totaled ${h_fee:,.2f}."
+                    f"At a transaction value of {amt_str}, the variable percentage fee (`3.49%`) plus cross-border or fixed charges totaled {fee_str}."
                 )
                 card = {
                     "type": "transaction_spotlight",
                     "title": f"Top Fee Outlier: {h_id}",
                     "subtitle": f"{h_customer} • {h_country}",
                     "metrics": [
-                        {"label": "Order Amount", "value": f"${h_amt:,.2f} {h_curr}", "accentColor": "blue"},
-                        {"label": "Processing Fee", "value": f"${h_fee:,.2f} {h_curr}", "accentColor": "rose"},
+                        {"label": "Order Amount", "value": amt_str, "accentColor": "blue"},
+                        {"label": "Processing Fee", "value": fee_str, "accentColor": "rose"},
                         {"label": "Effective Rate", "value": f"{h_pct}%", "accentColor": "amber"},
                         {"label": "Status", "value": h_status, "accentColor": "emerald" if h_status == "COMPLETED" else "rose"}
                     ],
@@ -393,9 +587,14 @@ class AIAgentService:
             reply = (
                 f"### 🔍 Net Received Reconciliation Analysis\n\n"
                 f"Your net received amount (**${net_received:,.2f} USD**) is **${deduction_diff:,.2f} USD** lower than gross volume (**${gross_volume:,.2f} USD**) due to three verified financial factors:\n\n"
-                f"1. **Payment Processing Fees (-${total_fees:,.2f} USD):** Standard PayPal merchant charges ($3.49% + $0.49) assessed automatically at capture.\n"
-                f"2. **Disputed Funds On Hold (-${disputed_vol:,.2f} USD):** {len(disputed_txns)} order(s) currently under bank dispute hold (e.g. TXN-984199 for $6,500.00).\n"
-                f"3. **Declined / Denied Checkouts (-${denied_vol:,.2f} USD):** {len(denied_txns)} payment(s) denied by card issuers, resulting in $0.00 merchant settlement.\n\n"
+                f"1. **Payment Processing Fees (-${total_fees:,.2f} USD):** Standard PayPal merchant charges (3.49% + $0.49) assessed automatically at capture.\n"
+                f"2. **Disputed Funds On Hold (-${disputed_vol:,.2f} USD):** {len(disputed_txns)} order(s) currently under bank dispute hold"
+                + (
+                    f" (e.g. {disputed_txns[0].get('id')} for ${float(disputed_txns[0].get('amount', 0)):,.2f}).\n"
+                    if disputed_txns
+                    else ".\n"
+                )
+                + f"3. **Declined / Denied Checkouts (-${denied_vol:,.2f} USD):** {len(denied_txns)} payment(s) denied by card issuers, resulting in $0.00 merchant settlement.\n\n"
                 f"**Summary Equation:**\n"
                 f"`Gross ($" f"{gross_volume:,.2f}) - Fees (${total_fees:,.2f}) - Dispute Holds (${disputed_vol:,.2f}) - Denials (${denied_vol:,.2f}) = Net Settled (${net_received:,.2f})`"
             )
@@ -500,8 +699,13 @@ class AIAgentService:
             ]
 
         elif intent == "COST_REDUCTION":
+            micro_orders = [t for t in txns_dict if float(convert_to_usd(t.get("amount", 0), t.get("currency", "USD"))) <= 12.0]
+            curr_analysis = cost_analysis.get("currencyAnalysis", [])
+            non_usd_fx_loss = round(sum(float(c.get("conversionSpreadLossEst", 0.0)) for c in curr_analysis), 2)
+            micro_savings = round(len(micro_orders) * 0.30, 2)
+            est_total_savings = round(non_usd_fx_loss + micro_savings, 2)
             recs = [
-                "1. **Adopt PayPal Micropayments Tier:** For order values below $12.00 (e.g. TXN-984203 for $12.50), the micropayment rate (`5.0% + $0.05`) saves an estimated $0.28 to $0.35 per transaction over the standard `3.49% + $0.49` fee.",
+                f"1. **Adopt PayPal Micropayments Tier:** Across {len(micro_orders)} low-ticket order(s) under $12.00 USD in your ledger, the micropayment rate (`5.0% + $0.05`) saves an estimated $0.28 to $0.35 per transaction over the standard `3.49% + $0.49` fee.",
                 "2. **Enable Native Foreign Currency Balances:** Holding native EUR and GBP in your PayPal business account avoids PayPal's ~3.50% automatic currency conversion spread on international checkouts.",
                 "3. **Upload Online Tracking within 24 Hours:** Immediate tracking synchronization protects against 'Item Not Received' disputes under PayPal Seller Protection, avoiding standard $15–$20 chargeback processing fees."
             ]
@@ -509,7 +713,7 @@ class AIAgentService:
                 f"### 💡 Evidence-Based Cost Optimization Recommendations\n\n"
                 f"Based on your actual transaction volume (${gross_volume:,.2f}) and fee schedule ({effective_rate}% effective rate):\n\n"
                 + "\n\n".join(recs) +
-                f"\n\n*Finova estimates these optimizations can lower monthly payment-processing overhead by **$180 – $340 USD**.*"
+                f"\n\n*AI-assisted estimate (not guaranteed): these optimizations identify up to **${est_total_savings:,.2f} USD** in fee & FX savings across your recorded ledger.*"
             )
             card = {
                 "type": "recommendation_list",
@@ -593,7 +797,7 @@ class AIAgentService:
                 f"- **Total Scanned Messages / Invoices:** **{total_scans}** communications audited.\n"
                 f"- **Average Threat Risk Score:** **{avg_threat}/100**.\n"
                 f"- **Critical Threats Intercepted:** **{crit_count}** phishing / overpayment attempts.\n\n"
-                f"**Common Vectors Detected:** Impersonation of official PayPal domains (`quick-verify-paypal.cc`), urgent account suspension demands, and overpayment check triangulation scams."
+                f"**Protection Scope:** Monitors impersonation domains, urgent suspension pretexts, credential harvesting prompts, and overpayment triangulation demands."
             )
             card = {
                 "type": "metric_summary",
@@ -648,13 +852,17 @@ class AIAgentService:
 
         elif intent == "SPECIFIC_TXN":
             txn_id_match = re.search(r"\b(txn-[a-z0-9]+)\b", query, re.I)
-            target_id = txn_id_match.group(1).upper() if txn_id_match else "TXN-984208"
+            target_id = txn_id_match.group(1).upper() if txn_id_match else (txns_dict[0].get("id", "").upper() if txns_dict else "UNKNOWN")
             found_txn = next((t for t in txns_dict if t.get("id", "").upper() == target_id), None)
 
             if found_txn:
                 amt = float(found_txn.get("amount", 0.0))
                 curr = found_txn.get("currency", "USD")
-                fee = float(found_txn.get("actualFee") or found_txn.get("estimatedFee") or 0.0)
+                fee = float(
+                    found_txn.get("actualFee")
+                    if found_txn.get("actualFee") is not None
+                    else (found_txn.get("estimatedFee") or 0.0)
+                )
                 net = float(found_txn.get("netAmount", 0.0))
                 status = found_txn.get("status")
                 c_name = found_txn.get("customerName", "Customer")
@@ -663,12 +871,16 @@ class AIAgentService:
                 anomaly = found_txn.get("isAnomaly", False)
                 reason = found_txn.get("anomalyReason") or "Normal authorized checkout"
 
+                amt_s = f"${amt:,.2f} USD" if curr == "USD" else (f"¥{amt:,.0f} JPY" if curr == "JPY" else f"{amt:,.2f} {curr}")
+                fee_s = f"${fee:,.2f} USD" if curr == "USD" else (f"¥{fee:,.0f} JPY" if curr == "JPY" else f"{fee:,.2f} {curr}")
+                net_s = f"${net:,.2f} USD" if curr == "USD" else (f"¥{net:,.0f} JPY" if curr == "JPY" else f"{net:,.2f} {curr}")
+
                 reply = (
                     f"### 🔍 Detailed Audit for {target_id}\n\n"
                     f"- **Customer:** {c_name} ({found_txn.get('customerEmail')})\n"
-                    f"- **Gross Amount:** **${amt:,.2f} {curr}**\n"
-                    f"- **Fee Deducted:** **${fee:,.2f} {curr}**\n"
-                    f"- **Net Settled:** **${net:,.2f} {curr}**\n"
+                    f"- **Gross Amount:** **{amt_s}**\n"
+                    f"- **Fee Deducted:** **{fee_s}**\n"
+                    f"- **Net Settled:** **{net_s}**\n"
                     f"- **Payment Method:** {found_txn.get('paymentMethod', 'PayPal Wallet')}\n"
                     f"- **Status:** **{status}**\n"
                     f"- **Risk Assessment:** **{risk} / 100 ({r_level})** {'[FLAGGED ANOMALY]' if anomaly else '[CLEAN]'}\n"
@@ -679,9 +891,9 @@ class AIAgentService:
                     "title": f"Transaction Detail: {target_id}",
                     "subtitle": f"{c_name} • {found_txn.get('country')}",
                     "metrics": [
-                        {"label": "Amount", "value": f"${amt:,.2f} {curr}", "accentColor": "blue"},
-                        {"label": "Processing Fee", "value": f"${fee:,.2f} {curr}", "accentColor": "amber"},
-                        {"label": "Net Amount", "value": f"${net:,.2f} {curr}", "accentColor": "emerald"},
+                        {"label": "Amount", "value": amt_s, "accentColor": "blue"},
+                        {"label": "Processing Fee", "value": fee_s, "accentColor": "amber"},
+                        {"label": "Net Amount", "value": net_s, "accentColor": "emerald"},
                         {"label": "Risk Score", "value": f"{risk}/100 ({r_level})", "accentColor": "rose" if risk >= 60 else "emerald"}
                     ],
                     "actionHint": "All details retrieved directly from PayPal Sandbox database records."
@@ -738,26 +950,59 @@ class AIAgentService:
         self,
         query: str,
         facts_context: Dict[str, Any],
-        history: Optional[List[Dict[str, Any]]] = None
+        history: Optional[List[Dict[str, Any]]] = None,
+        api_key: Optional[str] = None,
     ) -> Optional[str]:
+        """Public helper returning only the Gemini reply string (or None) for backward-compatible callers."""
+        reply, _, _ = self._call_gemini_with_context_detailed(
+            query=query,
+            facts_context=facts_context,
+            history=history,
+            api_key=api_key,
+        )
+        return reply
+
+    def _call_gemini_with_context_detailed(
+        self,
+        query: str,
+        facts_context: Dict[str, Any],
+        history: Optional[List[Dict[str, Any]]] = None,
+        api_key: Optional[str] = None,
+    ) -> tuple[Optional[str], bool, int]:
         """
-        Invokes Gemini API with grounded facts to provide professional natural language explanations.
-        Never hallucinate numbers.
+        Invokes Gemini API with grounded facts, retrieved RAG chunks, and sanitized history.
+        Returns (reply_text, succeeded_bool, prompt_char_count). Never leaks secrets on failure.
         """
+        prompt = ""
         try:
             system_prompt = (
                 "You are Finova AI's Senior Financial Support Agent for PayPal merchants. "
                 "You provide precise, evidence-based financial intelligence and merchant guidance. "
                 "CRITICAL RULES:\n"
                 "1. NEVER invent, assume, or hallucinate transactions, IDs, fees, or amounts.\n"
-                "2. Strictly use the deterministic facts provided in the Ground-Truth Context.\n"
-                "3. If information is not in the context, explicitly say it is not recorded in the ledger.\n"
+                "2. Strictly use the deterministic facts and retrieved chunks provided in Ground-Truth Context.\n"
+                "3. Clearly distinguish verified ledger data from general advisory suggestions; never promise guaranteed returns.\n"
                 "4. You are strictly read-only: never claim you can move money, modify accounts, or file disputes.\n"
                 "5. Format output with clean GitHub markdown (headers, bullet points, bold numbers)."
             )
 
+            top_fee = facts_context.get("highest_fee_txn")
+            top_fee_line = ""
+            if top_fee:
+                fee_amt = top_fee.get("actualFee") if top_fee.get("actualFee") is not None else top_fee.get("estimatedFee")
+                top_fee_line = (
+                    f"- Highest Fee Transaction: {top_fee.get('id')} "
+                    f"(${float(top_fee.get('amount', 0)):,.2f} {top_fee.get('currency', 'USD')}, fee ${float(fee_amt or 0):,.2f})\n"
+                )
+
+            rag_lines = "\n".join(
+                f"  * [{c.get('source')}]: {c.get('text')}"
+                for c in (facts_context.get("retrieved_chunks") or [])[:6]
+            )
+            scam_count = len(facts_context.get("scam_logs") or [])
+
             context_str = (
-                f"GROUND-TRUTH CONTEXT (from PayPal Database):\n"
+                f"GROUND-TRUTH CONTEXT (Strictly Scoped to Authenticated Merchant):\n"
                 f"- Gross Volume: ${facts_context.get('gross_volume', 0.0):,.2f} USD\n"
                 f"- Completed Volume: ${facts_context.get('completed_volume', 0.0):,.2f} USD\n"
                 f"- Total Fees Paid: ${facts_context.get('total_fees', 0.0):,.2f} USD (Effective Rate: {facts_context.get('effective_rate', 0.0)}%)\n"
@@ -766,26 +1011,45 @@ class AIAgentService:
                 f"- Dispute Rate: {facts_context.get('dispute_rate')}%\n"
                 f"- Denied Transactions: {facts_context.get('denied_count')}\n"
                 f"- Detected Anomalies: {facts_context.get('anomalies_count')}\n"
+                f"- Recent Scam Audits Logged: {scam_count}\n"
+                f"{top_fee_line}"
+                f"RETRIEVED RAG CONTEXT:\n{rag_lines}\n"
             )
 
-            prompt = f"{system_prompt}\n\n{context_str}\n\nMerchant Question: {query}\n\nFinova AI Response:"
+            history_lines = []
+            for turn in (history or [])[-4:]:
+                raw_role = str(turn.get("sender") or turn.get("role") or "user").strip().lower()
+                role = "ASSISTANT" if raw_role in {"assistant", "ai", "model", "bot"} else "USER"
+                raw_turn = str(turn.get("content", "") or turn.get("text", ""))
+                cleaned_turn, hist_blocked, _ = self.sanitize_input(raw_turn)
+                safe_turn = "[REDACTED_INJECTION]" if hist_blocked else redact_sensitive_text(cleaned_turn)[:240]
+                if safe_turn:
+                    history_lines.append(f"{role}: {safe_turn}")
+            history_block = "\n".join(history_lines)
+
+            prompt = f"{system_prompt}\n\n{context_str}\n"
+            if history_block:
+                prompt += f"RECENT CONVERSATION:\n{history_block}\n\n"
+            prompt += f"Merchant Question: {query}\n\nFinova AI Response:"
 
             url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
             payload = {
                 "contents": [{"parts": [{"text": prompt}]}]
             }
 
+            key_to_use = api_key or self._resolve_api_key()
             with httpx.Client(timeout=10.0, follow_redirects=False) as client:
-                resp = client.post(url, json=payload, headers={"x-goog-api-key": self.api_key})
+                resp = client.post(url, json=payload, headers={"x-goog-api-key": key_to_use})
                 if resp.status_code == 200:
                     data = resp.json()
                     candidates = data.get("candidates", [])
                     if candidates:
                         parts = candidates[0].get("content", {}).get("parts", [])
-                        if parts:
-                            return parts[0].get("text", "")
-        except Exception:
-            return None
-        return None
+                        if parts and parts[0].get("text"):
+                            return parts[0].get("text", ""), True, len(prompt)
+                logger.warning("Gemini API non-200 response [%s]; using deterministic RAG fallback.", resp.status_code)
+        except Exception as exc:
+            logger.warning("Gemini API call failed (%s); using deterministic RAG fallback.", type(exc).__name__)
+        return None, False, len(prompt or query)
 
 ai_agent_service = AIAgentService()

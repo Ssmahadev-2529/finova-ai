@@ -123,7 +123,7 @@ export const AccountHealthView: React.FC<AccountHealthViewProps> = ({
   const disputeRate = metrics.disputeRate;
   const safetyMargin = metrics.safetyMarginText ||
     (disputeRate < 1.0
-      ? `You can absorb approximately ${metrics.maxDisputesTolerated ?? 12} additional disputes before reaching the 1.00% PayPal ceiling.`
+      ? `You can absorb approximately ${metrics.maxDisputesTolerated ?? 0} additional disputes before reaching the 1.00% PayPal ceiling.`
       : 'Dispute ceiling exceeded (>= 1.00%). Immediate case resolution recommended.');
 
   // Extract score breakdown
@@ -543,28 +543,30 @@ export const AccountHealthView: React.FC<AccountHealthViewProps> = ({
               <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#050C1C] border border-slate-200 dark:border-[#162F64]">
                 <span className="text-slate-500 dark:text-[#7E96C4] text-[11px] block">Average Ticket Size</span>
                 <span className="text-base font-extrabold text-slate-900 dark:text-white font-mono">
-                  ${behavior?.averageAmount ? behavior.averageAmount.toLocaleString('en-US', { minimumFractionDigits: 2 }) : '1,987.89'}
+                  ${(behavior?.averageAmount ?? 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                 </span>
-                <span className="text-[10px] text-slate-400 block mt-0.5">Median: ${behavior?.medianAmount ?? 620.00}</span>
+                <span className="text-[10px] text-slate-400 block mt-0.5">
+                  Median: ${(behavior?.medianAmount ?? 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                </span>
               </div>
               <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#050C1C] border border-slate-200 dark:border-[#162F64]">
                 <span className="text-slate-500 dark:text-[#7E96C4] text-[11px] block">Checkout Velocity</span>
                 <span className="text-base font-extrabold text-slate-900 dark:text-white font-mono">
-                  {behavior?.velocityPerDay ?? 1.4} / day
+                  {(behavior?.velocityPerDay ?? 0).toFixed(1)} / day
                 </span>
                 <span className="text-[10px] text-slate-400 block mt-0.5">Total: {behavior?.totalTransactions ?? transactions.length} orders</span>
               </div>
               <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#050C1C] border border-slate-200 dark:border-[#162F64]">
                 <span className="text-slate-500 dark:text-[#7E96C4] text-[11px] block">Cross-Border Share</span>
                 <span className="text-base font-extrabold text-slate-900 dark:text-white font-mono">
-                  {behavior?.internationalRatio ?? 44.4}%
+                  {(behavior?.internationalRatio ?? 0).toFixed(1)}%
                 </span>
                 <span className="text-[10px] text-slate-400 block mt-0.5">Foreign buyers</span>
               </div>
               <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#050C1C] border border-slate-200 dark:border-[#162F64]">
                 <span className="text-slate-500 dark:text-[#7E96C4] text-[11px] block">Largest Order</span>
                 <span className="text-base font-extrabold text-slate-900 dark:text-white font-mono">
-                  ${behavior?.maxAmount ? behavior.maxAmount.toLocaleString('en-US', { minimumFractionDigits: 2 }) : '6,500.00'}
+                  ${(behavior?.maxAmount ?? 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                 </span>
                 <span className="text-[10px] text-slate-400 block mt-0.5">Single ticket peak</span>
               </div>
@@ -577,7 +579,12 @@ export const AccountHealthView: React.FC<AccountHealthViewProps> = ({
 
           <div className="pt-3 border-t border-slate-200 dark:border-[#162F64] text-[11px] text-slate-500 dark:text-[#7E96C4] flex items-center gap-1.5">
             <Globe className="w-3.5 h-3.5 text-[#0070BA] shrink-0" />
-            <span>Currencies active: {behavior?.currencyDistribution ? Object.keys(behavior.currencyDistribution).join(', ') : 'USD, EUR, GBP'}</span>
+            <span>
+              Currencies active:{' '}
+              {behavior?.currencyDistribution && Object.keys(behavior.currencyDistribution).length > 0
+                ? Object.keys(behavior.currencyDistribution).join(', ')
+                : 'None recorded'}
+            </span>
           </div>
         </div>
       </div>

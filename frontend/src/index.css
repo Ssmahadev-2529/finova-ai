@@ -3,22 +3,32 @@
 @tailwind utilities;
 
 :root {
-  --m-ease: cubic-bezier(0.16, 1, 0.3, 1);
+  --m-ease: cubic-bezier(0.2, 0.8, 0.2, 1);
   --m-in: 140ms;
   --m-out: 200ms;
   --m-press: 90ms;
+  --m-focus: 200ms;
   --display-tracking: -0.025em;
 }
 
 @layer base {
   body {
-    @apply bg-[#F8FAFC] text-slate-800 font-sans transition-colors duration-200 antialiased;
+    @apply bg-[#F5F7FA] text-[#001435] font-sans transition-colors duration-200 antialiased;
   }
   .dark body {
     @apply bg-[#030816] text-slate-100;
   }
   h1, h2, h3 {
+    font-family: "Plus Jakarta Sans", Inter, system-ui, sans-serif;
     letter-spacing: var(--display-tracking);
+  }
+  :where(a, button, input, select, textarea, [tabindex]):focus-visible {
+    outline: 2px solid #0070BA;
+    outline-offset: 2px;
+    transition: outline-offset var(--m-focus) var(--m-ease);
+  }
+  .dark :where(a, button, input, select, textarea, [tabindex]):focus-visible {
+    outline-color: #38BDF8;
   }
 }
 
@@ -62,13 +72,24 @@
   background: #254B94;
 }
 
-/* Premium Fintech Surface Cards */
+/* Premium PayPal Merchant Surface Cards */
 .fintech-card {
-  @apply bg-white dark:bg-[#071126] border border-slate-200/90 dark:border-white/[0.08] rounded-2xl shadow-fintech-card dark:shadow-fintech-card-dark transition-all duration-200;
+  @apply bg-white dark:bg-[#071126] border border-[#E3E8EE] dark:border-white/[0.08] rounded-2xl shadow-fintech-card dark:shadow-fintech-card-dark transition-all duration-200;
 }
 
 .fintech-card-interactive {
-  @apply fintech-card hover:-translate-y-0.5 hover:shadow-fintech-card-hover dark:hover:shadow-fintech-card-dark-hover dark:hover:border-[#0070BA]/40 cursor-pointer;
+  @apply fintech-card cursor-pointer;
+  transition: transform var(--m-in) var(--m-ease), box-shadow var(--m-out) var(--m-ease), border-color var(--m-in) var(--m-ease);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .fintech-card-interactive:hover {
+    transform: translateY(-2px);
+    @apply shadow-fintech-card-hover dark:shadow-fintech-card-dark-hover dark:border-[#0070BA]/40;
+  }
+  .btn-press:hover:not(:disabled) {
+    transform: translateY(-1px);
+  }
 }
 
 .fintech-panel {
@@ -79,9 +100,36 @@
   @apply bg-slate-100/70 dark:bg-[#040B1A] border border-slate-200/70 dark:border-white/[0.05] rounded-xl;
 }
 
-/* Tactile button micro-interaction */
+/* Tactile button & arrow micro-interactions (design-taste-frontend motion tokens) */
 .btn-press {
-  @apply active:scale-[0.98] transition-transform duration-100;
+  transition: transform var(--m-press) var(--m-ease), background-color var(--m-in) var(--m-ease), box-shadow var(--m-out) var(--m-ease), border-color var(--m-in) var(--m-ease);
+}
+.btn-press:active:not(:disabled) {
+  transform: translateY(1px) scale(0.985);
+}
+
+.m-arrow {
+  transition: transform var(--m-in) var(--m-ease);
+}
+@media (hover: hover) and (pointer: fine) {
+  .group:hover .m-arrow {
+    transform: translateX(3px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+  .fintech-card-interactive:hover,
+  .btn-press:hover:not(:disabled),
+  .btn-press:active:not(:disabled),
+  .group:hover .m-arrow {
+    transform: none !important;
+  }
 }
 
 /* Glassmorphism surfaces */

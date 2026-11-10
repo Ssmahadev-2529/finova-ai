@@ -381,11 +381,16 @@ class ScamShieldService:
         self,
         db: Session,
         limit: int = 15,
-        scoped_user_id: Optional[str] = None
+        scoped_user_id: Optional[str] = None,
+        offset: int = 0,
+        risk_level: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Retrieves recent scam inspection records from database scoped to tenant."""
         query = scope_scam_audit_query(db.query(ScamAuditModel), ScamAuditModel, scoped_user_id)
-        records = query.order_by(ScamAuditModel.created_at.desc()).limit(limit).all()
+        if risk_level and risk_level.strip().upper() != "ALL":
+            query = query.filter(ScamAuditModel.risk_level == risk_level.strip().upper())
+        safe_offset = max(0, int(offset)) if (isinstance(offset, int) and not isinstance(offset, bool)) else 0
+        records = query.order_by(ScamAuditModel.created_at.desc()).offset(safe_offset).limit(limit).all()
         return [r.to_dict() for r in records]
 
     def get_threat_distribution(

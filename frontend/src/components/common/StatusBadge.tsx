@@ -10,7 +10,7 @@ interface StatusBadgeProps {
 export const StatusBadge: React.FC<StatusBadgeProps> = ({ status, size = 'md' }) => {
   const sizeClasses = size === 'sm' ? 'text-[10px] px-2 py-0.5' : 'text-xs px-2.5 py-1';
 
-  const config = {
+  const configs: Record<TransactionStatus, { label: string; bg: string; icon: React.ElementType }> = {
     COMPLETED: {
       label: 'Completed',
       bg: 'bg-emerald-50 dark:bg-emerald-950/40 text-emerald-800 dark:text-emerald-300 border-emerald-200/90 dark:border-emerald-800/40',
@@ -20,6 +20,16 @@ export const StatusBadge: React.FC<StatusBadgeProps> = ({ status, size = 'md' })
       label: 'Pending',
       bg: 'bg-amber-50 dark:bg-amber-950/40 text-amber-800 dark:text-amber-300 border-amber-200/90 dark:border-amber-800/40',
       icon: Clock,
+    },
+    REFUNDING: {
+      label: 'Refunding',
+      bg: 'bg-amber-50 dark:bg-amber-950/40 text-amber-800 dark:text-amber-300 border-amber-200/90 dark:border-amber-800/40',
+      icon: RotateCcw,
+    },
+    REFUND_UNKNOWN: {
+      label: 'Refund Sync',
+      bg: 'bg-amber-50 dark:bg-amber-950/40 text-amber-800 dark:text-amber-300 border-amber-200/90 dark:border-amber-800/40',
+      icon: AlertCircle,
     },
     REFUNDED: {
       label: 'Refunded',
@@ -33,10 +43,11 @@ export const StatusBadge: React.FC<StatusBadgeProps> = ({ status, size = 'md' })
     },
     DISPUTED: {
       label: 'Disputed',
-      bg: 'bg-purple-50 dark:bg-purple-950/40 text-purple-800 dark:text-purple-300 border-purple-200/90 dark:border-purple-800/40',
+      bg: 'bg-orange-50 dark:bg-orange-950/40 text-orange-800 dark:text-orange-300 border-orange-200/90 dark:border-orange-800/40',
       icon: AlertCircle,
     },
-  }[status];
+  };
+  const config = configs[status] || configs.PENDING;
 
   const Icon = config.icon;
 

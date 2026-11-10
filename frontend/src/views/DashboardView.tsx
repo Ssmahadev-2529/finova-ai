@@ -69,6 +69,9 @@ interface DashboardViewProps {
   aiInsights?: AiInsightCard[] | null;
   selectedPeriod?: 'daily' | 'weekly' | 'monthly';
   onChangePeriod?: (period: 'daily' | 'weekly' | 'monthly') => void;
+  isLoading?: boolean;
+  isAuthenticated?: boolean;
+  onOpenAuth?: () => void;
 }
 
 const CustomChartTooltip: React.FC<any> = ({ active, payload, label }) => {
@@ -117,9 +120,16 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   patternsData,
   aiInsights,
   selectedPeriod = 'daily',
-  onChangePeriod
+  onChangePeriod,
+  isLoading = false,
+  isAuthenticated = false,
+  onOpenAuth
 }) => {
   const [tableStatusFilter, setTableStatusFilter] = useState<string>('ALL');
+  const [dateFrom, setDateFrom] = useState<string>('');
+  const [dateTo, setDateTo] = useState<string>('');
+  const [filteredSummary, setFilteredSummary] = useState<AnalyticsSummary | null>(null);
+  const [summaryFilterError, setSummaryFilterError] = useState<string | null>(null);
 
   // --- Phase 7 State ---
   // Period-over-period comparison state
@@ -228,16 +238,39 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     return () => { isMounted = false; };
   }, [simVolumeGrowth, simAvgTicket, simCrossBorder, simTier, transactions.length, analyticsSummary]);
 
-  // Compute metrics (prioritize backend AnalyticsSummary if available)
-  const totalTransactions = analyticsSummary?.totalTransactions ?? transactions.length;
-  const totalVolume = analyticsSummary?.grossPaymentVolume ?? transactions.reduce((acc, curr) => acc + (curr.status !== 'DENIED' ? curr.amount : 0), 0);
-  const totalFees = analyticsSummary?.totalFees ?? transactions.reduce((acc, curr) => acc + (curr.actualFee ?? curr.estimatedFee), 0);
-  const totalNetReceived = analyticsSummary?.totalNetReceived ?? transactions.reduce((acc, curr) => acc + (curr.status === 'COMPLETED' ? curr.netAmount : 0), 0);
-  const anomalyCount = analyticsSummary?.riskMetrics.anomalyCount ?? transactions.filter(t => t.isAnomaly).length;
-  const confirmedCoverage = analyticsSummary?.confirmedFeeCoveragePct ?? 84.6;
-  const growthRate = trendsData?.summary.growthRatePct ?? 14.2;
+  // Compute metrics (prioritize date-filtered summary or backend AnalyticsSummary)
+  const activeSummary = filteredSummary ?? analyticsSummary;
+  const totalTransactions = activeSummary?.totalTransactions ?? transactions.length;
+  const totalVolume = activeSummary?.grossPaymentVolume ?? transactions.reduce((acc, curr) => acc + (curr.status !== 'DENIED' && curr.txnType !== 'expense' ? curr.amount : 0), 0);
+  const totalFees = activeSummary?.totalFees ?? transactions.reduce((acc, curr) => acc + (curr.actualFee ?? curr.estimatedFee ?? 0), 0);
+  const totalNetReceived = activeSummary?.totalNetReceived ?? transactions.reduce((acc, curr) => acc + (curr.status === 'COMPLETED' && curr.txnType !== 'expense' ? curr.netAmount : 0), 0);
+  const totalExpenses = activeSummary?.totalExpenses ?? transactions.reduce((acc, curr) => acc + (curr.txnType === 'expense' && curr.status !== 'DENIED' ? curr.amount : 0), 0);
+  const netCashFlow = activeSummary?.netCashFlow ?? (totalNetReceived - totalExpenses);
+  const anomalyCount = activeSummary?.riskMetrics.anomalyCount ?? transactions.filter(t => t.isAnomaly).length;
+  const confirmedCoverage = activeSummary?.confirmedFeeCoveragePct ?? (transactions.length > 0 ? Math.round((transactions.filter(t => t.actualFee !== undefined && t.actualFee !== null).length / transactions.length) * 1000) / 10 : 0);
+  const growthRate = trendsData?.summary ? trendsData.summary.growthRatePct : null;
 
-  // Chart data from backend trends or forecast
+  const handleApplyDateFilter = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!dateFrom && !dateTo) {
+      setFilteredSummary(null);
+      setSummaryFilterError(null);
+      return;
+    }
+    if (!isAuthenticated) {
+      setSummaryFilterError('Sign in to query server-side date range analytics.');
+      return;
+    }
+    setSummaryFilterError(null);
+    try {
+      const res = await api.getAnalyticsSummary(dateFrom || undefined, dateTo || undefined);
+      setFilteredSummary(res);
+    } catch (err: any) {
+      setSummaryFilterError(err?.message || 'Invalid date filter.');
+    }
+  };
+
+  // Chart data from backend trends or forecast (never fabricate Mon-Sun synthetic arrays)
   const chartData = forecastMode === 'forecast' && forecastData?.data && forecastData.data.length > 0
     ? forecastData.data.map((d) => ({
         day: d.periodLabel,
@@ -250,15 +283,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       }))
     : trendsData?.data && trendsData.data.length > 0
     ? trendsData.data
-    : [
-        { day: 'Mon', volume: 4200, fee: 148, net: 4052, anomalies: 0 },
-        { day: 'Tue', volume: 6850, fee: 241, net: 6609, anomalies: 1 },
-        { day: 'Wed', volume: 5120, fee: 182, net: 4938, anomalies: 0 },
-        { day: 'Thu', volume: 8900, fee: 312, net: 8588, anomalies: 2 },
-        { day: 'Fri', volume: 7400, fee: 260, net: 7140, anomalies: 0 },
-        { day: 'Sat', volume: 11200, fee: 395, net: 10805, anomalies: 1 },
-        { day: 'Sun', volume: 9450, fee: 332, net: 9118, anomalies: 1 },
-      ];
+    : [];
 
   // Filter transactions for recent ledger table
   const filteredRecentTransactions = transactions.filter((txn) => {
@@ -282,9 +307,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               <span className="text-[10px] uppercase font-extrabold tracking-wider px-2 py-0.5 rounded-full bg-[#FFC439] text-[#001435]">
                 Commercial Tier 3.49% + $0.49
               </span>
-              {analyticsSummary && (
+              {activeSummary && (
                 <span className="text-[10px] uppercase font-extrabold tracking-wider px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-200 border border-emerald-400/30">
-                  {analyticsSummary.sourceBreakdown.sandbox.count} Sandbox Captures Verified
+                  {activeSummary.sourceBreakdown.sandbox.count} Sandbox Captures Verified
                 </span>
               )}
             </div>
@@ -299,15 +324,71 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         </div>
       </div>
 
+      {/* Analytics Date-Range Filter & Cash Flow Summary Bar */}
+      <div className="fintech-card p-3.5 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+        <form onSubmit={handleApplyDateFilter} className="flex flex-wrap items-center gap-2 text-xs">
+          <label htmlFor="dash-date-from" className="font-semibold text-slate-600 dark:text-[#8EA1C7]">From:</label>
+          <input
+            id="dash-date-from"
+            type="date"
+            value={dateFrom}
+            onChange={(e) => setDateFrom(e.target.value)}
+            className="py-1.5 px-2.5 rounded-xl bg-slate-50 dark:bg-[#050C1C] border border-slate-200 dark:border-[#18366E] text-slate-800 dark:text-white"
+          />
+          <label htmlFor="dash-date-to" className="font-semibold text-slate-600 dark:text-[#8EA1C7]">To:</label>
+          <input
+            id="dash-date-to"
+            type="date"
+            value={dateTo}
+            onChange={(e) => setDateTo(e.target.value)}
+            className="py-1.5 px-2.5 rounded-xl bg-slate-50 dark:bg-[#050C1C] border border-slate-200 dark:border-[#18366E] text-slate-800 dark:text-white"
+          />
+          <button
+            type="submit"
+            className="px-3.5 py-1.5 rounded-full bg-[#0070BA] hover:bg-[#005EA6] text-white font-bold"
+          >
+            Apply Range
+          </button>
+          {(dateFrom || dateTo || filteredSummary) && (
+            <button
+              type="button"
+              onClick={() => {
+                setDateFrom('');
+                setDateTo('');
+                setFilteredSummary(null);
+                setSummaryFilterError(null);
+              }}
+              className="px-3 py-1.5 rounded-full bg-slate-100 dark:bg-[#0E2046] text-slate-700 dark:text-white font-semibold"
+            >
+              Clear
+            </button>
+          )}
+          {summaryFilterError && <span className="text-rose-600 text-[11px] font-semibold">{summaryFilterError}</span>}
+        </form>
+
+        <div className="flex flex-wrap items-center gap-4 text-xs font-mono">
+          <div>
+            <span className="text-slate-500 dark:text-[#7E96C4] font-sans mr-1">Expenses:</span>
+            <span className="font-bold text-rose-600 dark:text-rose-400">-${totalExpenses.toFixed(2)}</span>
+          </div>
+          <div>
+            <span className="text-slate-500 dark:text-[#7E96C4] font-sans mr-1">Net Cash Flow:</span>
+            <span className={`font-bold ${netCashFlow >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}`}>
+              ${netCashFlow.toFixed(2)}
+            </span>
+          </div>
+        </div>
+      </div>
+
       {/* Primary KPI Stat Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <StatCard
           title="Gross Payment Volume"
-          value={`$${totalVolume.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+          value={isLoading && transactions.length === 0 ? '...' : `$${totalVolume.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
           subtitle={`${totalTransactions} transactions recorded`}
           icon={DollarSign}
           accentColor="blue"
-          change={{ value: `${growthRate >= 0 ? '+' : ''}${growthRate}%`, isPositive: growthRate >= 0 }}
+          change={growthRate !== null ? { value: `${growthRate >= 0 ? '+' : ''}${growthRate}%`, isPositive: growthRate >= 0 } : undefined}
         />
         <StatCard
           title="PayPal Transaction Fees"
@@ -327,7 +408,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           subtitle="Available in merchant balance"
           icon={Wallet}
           accentColor="emerald"
-          change={{ value: '+15.8%', isPositive: true }}
         />
         <StatCard
           title="Seller Health Standing"
@@ -544,15 +624,15 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               <div className="text-[10px] text-rose-600 dark:text-rose-400 mt-0.5">Blocked by rules</div>
             </div>
 
-            <div className="p-2.5 rounded-xl bg-purple-50 dark:bg-purple-950/20 border border-purple-200 dark:border-purple-800/40">
-              <div className="flex items-center justify-between text-purple-700 dark:text-purple-400 text-xs font-bold mb-1">
+            <div className="p-2.5 rounded-xl bg-orange-50 dark:bg-orange-950/20 border border-orange-200 dark:border-orange-800/40">
+              <div className="flex items-center justify-between text-orange-700 dark:text-orange-400 text-xs font-bold mb-1">
                 <span className="flex items-center gap-1"><AlertCircle className="w-3.5 h-3.5" /> Disputed</span>
                 <span className="font-mono">{analyticsSummary.statusBreakdown.DISPUTED?.count || 0}</span>
               </div>
               <div className="text-xs font-mono font-bold text-slate-900 dark:text-white">
                 ${(analyticsSummary.statusBreakdown.DISPUTED?.volume || 0).toLocaleString('en-US', { minimumFractionDigits: 2 })}
               </div>
-              <div className="text-[10px] text-purple-600 dark:text-purple-400 mt-0.5">Resolution Center</div>
+              <div className="text-[10px] text-orange-600 dark:text-orange-400 mt-0.5">Resolution Center</div>
             </div>
           </div>
         </div>
@@ -581,10 +661,10 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           </div>
           <button
             onClick={() => onNavigate('transactions')}
-            className="shrink-0 px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 dark:bg-rose-500/20 dark:hover:bg-rose-500/30 text-white dark:text-rose-300 border border-transparent dark:border-rose-500/40 text-xs font-bold flex items-center gap-1.5 transition-all shadow-sm"
+            className="group btn-press shrink-0 px-4 py-2 rounded-full bg-rose-600 hover:bg-rose-700 dark:bg-rose-500/20 dark:hover:bg-rose-500/30 text-white dark:text-rose-300 border border-transparent dark:border-rose-500/40 text-xs font-bold flex items-center gap-1.5 shadow-sm"
           >
             <span>Review Anomaly Ledger</span>
-            <ChevronRight className="w-3.5 h-3.5" />
+            <ChevronRight className="m-arrow w-3.5 h-3.5" />
           </button>
         </div>
       )}
@@ -600,7 +680,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   {forecastMode === 'forecast' ? 'Predictive Revenue Forecast & Error Bands' : 'PayPal Volume & Fee Trajectory'}
                 </h2>
                 {forecastMode === 'forecast' && (
-                  <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded-full bg-indigo-500/15 text-indigo-600 dark:text-indigo-400 border border-indigo-500/30">
+                  <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded-full bg-[#0070BA]/15 text-[#0070BA] dark:text-[#38BDF8] border border-[#0070BA]/30">
                     Holt's Linear (α=0.3, β=0.1)
                   </span>
                 )}
@@ -629,7 +709,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   onClick={() => setForecastMode('forecast')}
                   className={`px-2.5 py-1 rounded-lg font-bold flex items-center gap-1 transition-all ${
                     forecastMode === 'forecast'
-                      ? 'bg-indigo-600 text-white shadow-sm'
+                      ? 'bg-[#003087] text-white shadow-sm'
                       : 'text-slate-600 dark:text-[#7E96C4]'
                   }`}
                 >
@@ -659,7 +739,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
           {/* Forecast Summary Badges when active */}
           {forecastMode === 'forecast' && forecastData && (
-            <div className="grid grid-cols-3 gap-3 mb-4 p-3 rounded-xl bg-indigo-50/50 dark:bg-indigo-950/20 border border-indigo-100 dark:border-indigo-900/40 text-xs">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-4 p-3 rounded-xl bg-sky-50/60 dark:bg-[#0B1A3A]/50 border border-sky-200/80 dark:border-[#18366E] text-xs">
               <div>
                 <span className="text-[10px] text-slate-500 uppercase font-bold">Projected Gross Volume</span>
                 <div className="text-sm font-mono font-bold text-slate-900 dark:text-white">
@@ -691,14 +771,23 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               <span>PayPal Fee ($)</span>
             </div>
             {forecastMode === 'forecast' && (
-              <div className="flex items-center gap-1.5 text-indigo-600 dark:text-indigo-400 font-bold">
-                <span className="w-2.5 h-2.5 rounded-full bg-indigo-500 opacity-60"></span>
+              <div className="flex items-center gap-1.5 text-[#0070BA] dark:text-[#38BDF8] font-bold">
+                <span className="w-2.5 h-2.5 rounded-full bg-[#0070BA] opacity-70"></span>
                 <span>Confidence Error Band</span>
               </div>
             )}
           </div>
 
           <div className="h-64 w-full">
+            {chartData.length === 0 ? (
+              <div className="h-full flex flex-col items-center justify-center rounded-2xl border border-dashed border-slate-200 dark:border-[#18366E] text-center p-6">
+                <BarChart3 className="w-7 h-7 text-slate-400 mb-2" />
+                <p className="text-xs font-bold text-slate-700 dark:text-slate-200">No transaction trend data yet</p>
+                <p className="text-[11px] text-slate-500 dark:text-[#7E96C4] mt-1">
+                  Add a transaction or simulate a PayPal Sandbox checkout to visualize real volume and fee trajectories.
+                </p>
+              </div>
+            ) : (
             <ResponsiveContainer width="100%" height="100%">
               <AreaChart data={chartData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
                 <defs>
@@ -752,11 +841,12 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 />
               </AreaChart>
             </ResponsiveContainer>
+            )}
           </div>
 
           {forecastMode === 'forecast' && (
             <div className="mt-3 p-2.5 rounded-xl bg-slate-50 dark:bg-[#050C1C] border border-slate-200 dark:border-[#162F64] text-[11px] text-slate-500 dark:text-[#7E96C4] flex items-center gap-2">
-              <Info className="w-3.5 h-3.5 text-indigo-500 shrink-0" />
+              <Info className="w-3.5 h-3.5 text-[#0070BA] shrink-0" />
               <span>
                 Forecast Model: Mathematical projections based on historical transaction velocity and exponential smoothing. Estimates do not guarantee future PayPal captures.
               </span>
@@ -939,7 +1029,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       <div className="rounded-2xl bg-white dark:bg-[#081329] border border-slate-200 dark:border-[#162F64] p-5 shadow-sm">
         <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 mb-5">
           <div className="flex items-center gap-2.5">
-            <div className="p-2 rounded-xl bg-purple-500/10 text-purple-600 dark:text-purple-400">
+            <div className="p-2 rounded-xl bg-[#0070BA]/10 text-[#0070BA] dark:text-[#38BDF8]">
               <Sliders className="w-4 h-4" />
             </div>
             <div>
@@ -947,7 +1037,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 <h2 className="text-base font-extrabold text-slate-900 dark:text-white">
                   Decision Scenario Simulator
                 </h2>
-                <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded-full bg-purple-500/15 text-purple-600 dark:text-purple-400 border border-purple-500/30">
+                <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded-full bg-[#0070BA]/15 text-[#0070BA] dark:text-[#38BDF8] border border-[#0070BA]/30">
                   Deterministic Math Engine
                 </span>
               </div>
@@ -1085,8 +1175,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                     </div>
                   </div>
 
-                  <div className="p-3.5 rounded-xl bg-purple-50/50 dark:bg-purple-950/20 border border-purple-200 dark:border-purple-900/40">
-                    <div className="text-[10px] font-bold text-purple-600 dark:text-purple-400 uppercase tracking-wider mb-2">
+                  <div className="p-3.5 rounded-xl bg-sky-50/60 dark:bg-[#0B1A3A]/50 border border-sky-200/80 dark:border-[#18366E]">
+                    <div className="text-[10px] font-bold text-[#0070BA] dark:text-[#38BDF8] uppercase tracking-wider mb-2">
                       Simulated Projections
                     </div>
                     <div className="space-y-1.5 text-xs">
@@ -1110,7 +1200,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                       </div>
                       <div className="flex justify-between">
                         <span className="text-slate-500">Effective Rate:</span>
-                        <span className="font-mono font-bold text-purple-600 dark:text-purple-300">
+                        <span className="font-mono font-bold text-[#0070BA] dark:text-[#38BDF8]">
                           {simResult.projected.effectiveRate}%
                         </span>
                       </div>
@@ -1157,7 +1247,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
                     {simResult.assumptions.map((asmp, i) => (
                       <div key={i} className="text-[11px] text-slate-600 dark:text-slate-300 flex items-start gap-1">
-                        <span className="text-purple-500">•</span>
+                        <span className="text-[#0070BA]">•</span>
                         <span>{asmp}</span>
                       </div>
                     ))}

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Float, Integer, Boolean, DateTime, Text, Numeric
+from sqlalchemy import Column, String, Float, Integer, Boolean, DateTime, Text, Numeric, Index
 from datetime import datetime
 import json
 from database import Base
@@ -17,6 +17,11 @@ class PayPalOrderModel(Base):
 
 class TransactionModel(Base):
     __tablename__ = "transactions"
+    __table_args__ = (
+        Index("idx_transactions_user_created", "user_id", "created_at"),
+        Index("idx_transactions_user_status", "user_id", "status"),
+        Index("idx_transactions_user_category", "user_id", "category"),
+    )
 
     id = Column(String(64), primary_key=True, index=True)
     paypal_order_id = Column(String(128), unique=True, index=True, nullable=True)
@@ -46,8 +51,12 @@ class TransactionModel(Base):
     anomaly_reason = Column(Text, nullable=True)
     
     data_source = Column(String(16), default="sandbox")  # 'sandbox' or 'synthetic'
+    category = Column(String(64), default="Payment", nullable=True, index=True)
+    txn_type = Column(String(16), default="income", nullable=True, index=True)  # 'income' or 'expense'
+    notes = Column(Text, nullable=True)
     raw_paypal_payload = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=True)
 
     def to_dict(self):
         return {
@@ -71,7 +80,11 @@ class TransactionModel(Base):
             "isAnomaly": self.is_anomaly,
             "anomalyReason": self.anomaly_reason,
             "dataSource": self.data_source,
-            "createdAt": self.created_at.isoformat() if self.created_at else None
+            "category": self.category or "Payment",
+            "txnType": self.txn_type or "income",
+            "notes": self.notes,
+            "createdAt": self.created_at.isoformat() if self.created_at else None,
+            "updatedAt": self.updated_at.isoformat() if self.updated_at else None,
         }
 
 class ScamAuditModel(Base):

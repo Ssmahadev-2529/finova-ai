@@ -547,7 +547,7 @@ export const CostOptimizerView: React.FC = () => {
             <div className="p-4 rounded-2xl bg-white dark:bg-[#081329] border border-slate-200 dark:border-[#162F64] shadow-sm">
               <div className="text-xs text-slate-500 dark:text-[#7E96C4] font-semibold">Reconciliation Accuracy</div>
               <div className="text-2xl font-extrabold text-emerald-600 dark:text-emerald-400 font-mono mt-1">
-                {historicalData?.reconciliation.accuracyPct ?? 100.0}%
+                {historicalData ? `${historicalData.reconciliation.accuracyPct}%` : '—'}
               </div>
               <div className="text-[11px] text-slate-400 mt-1">Estimates vs Confirmed Capture</div>
             </div>
@@ -555,17 +555,17 @@ export const CostOptimizerView: React.FC = () => {
             <div className="p-4 rounded-2xl bg-white dark:bg-[#081329] border border-slate-200 dark:border-[#162F64] shadow-sm">
               <div className="text-xs text-slate-500 dark:text-[#7E96C4] font-semibold">Actual Confirmed Fees</div>
               <div className="text-2xl font-extrabold text-[#0070BA] dark:text-[#38BDF8] font-mono mt-1">
-                ${(historicalData?.reconciliation.totalActualFees ?? 18.26).toFixed(2)}
+                {historicalData ? `$${historicalData.reconciliation.totalActualFees.toFixed(2)}` : '$0.00'}
               </div>
               <div className="text-[11px] text-slate-400 mt-1">
-                {historicalData?.reconciliation.reconciledCount ?? 3} orders with PayPal breakdowns
+                {historicalData?.reconciliation.reconciledCount ?? 0} orders with PayPal breakdowns
               </div>
             </div>
 
             <div className="p-4 rounded-2xl bg-white dark:bg-[#081329] border border-slate-200 dark:border-[#162F64] shadow-sm">
               <div className="text-xs text-slate-500 dark:text-[#7E96C4] font-semibold">Pre-Capture Estimated Fees</div>
               <div className="text-2xl font-extrabold text-amber-600 dark:text-[#FFC439] font-mono mt-1">
-                ${(historicalData?.reconciliation.totalEstimatedFees ?? 547.45).toFixed(2)}
+                {historicalData ? `$${historicalData.reconciliation.totalEstimatedFees.toFixed(2)}` : '$0.00'}
               </div>
               <div className="text-[11px] text-slate-400 mt-1">Commercial schedule forecast</div>
             </div>
@@ -573,9 +573,11 @@ export const CostOptimizerView: React.FC = () => {
             <div className="p-4 rounded-2xl bg-white dark:bg-[#081329] border border-slate-200 dark:border-[#162F64] shadow-sm">
               <div className="text-xs text-slate-500 dark:text-[#7E96C4] font-semibold">Variance on Reconciled Subset</div>
               <div className="text-2xl font-extrabold text-slate-900 dark:text-white font-mono mt-1">
-                ${(historicalData?.reconciliation.variance ?? 0.00).toFixed(2)}
+                {historicalData ? `$${historicalData.reconciliation.variance.toFixed(2)}` : '$0.00'}
               </div>
-              <div className="text-[11px] text-emerald-600 dark:text-emerald-400 mt-1">0.0% unbilled delta</div>
+              <div className="text-[11px] text-emerald-600 dark:text-emerald-400 mt-1">
+                {historicalData ? 'Confirmed ledger variance' : 'Sign in to load live variance'}
+              </div>
             </div>
           </div>
 
@@ -775,14 +777,14 @@ export const CostOptimizerView: React.FC = () => {
       {/* TAB 4: AI COST RECOMMENDATIONS */}
       {activeTab === 'recommendations' && (
         <div className="space-y-4">
-          <div className="bg-gradient-to-r from-blue-900/40 via-[#00457C]/30 to-blue-950/40 border border-[#0070BA]/30 rounded-2xl p-4 text-xs text-blue-100 flex items-center justify-between gap-4">
+          <div className="bg-gradient-to-r from-[#003087] via-[#00457C] to-[#0070BA] border border-[#002C8A] rounded-2xl p-4 text-xs text-white flex items-center justify-between gap-4 shadow-sm">
             <div className="flex items-center gap-3">
-              <div className="p-2 rounded-xl bg-[#0070BA] text-white shrink-0">
+              <div className="p-2 rounded-xl bg-white/15 text-white shrink-0">
                 <Sparkles className="w-5 h-5 text-[#FFC439]" />
               </div>
               <div>
                 <span className="font-extrabold text-white text-sm">Verified PayPal Commercial Optimization Insights</span>
-                <p className="text-[11px] text-blue-200 mt-0.5">
+                <p className="text-[11px] text-blue-100 mt-0.5">
                   Calculated against your live transaction ledger. All recommendations comply strictly with official PayPal merchant fee schedules.
                 </p>
               </div>

@@ -3,6 +3,7 @@ import { NavigationTab } from '../../types';
 import {
   LayoutDashboard,
   Receipt,
+  Target,
   Calculator,
   ShieldAlert,
   Activity,
@@ -30,11 +31,12 @@ export const Sidebar: React.FC<SidebarProps> = ({
   const navItems: { id: NavigationTab; label: string; icon: React.ElementType; badge?: string }[] = [
     { id: 'dashboard', label: 'Overview Dashboard', icon: LayoutDashboard },
     { id: 'transactions', label: 'Transactions & Ledger', icon: Receipt, badge: 'Live REST' },
+    { id: 'budgets', label: 'Budgets & Categories', icon: Target, badge: 'FX Aware' },
     { id: 'cost-optimizer', label: 'PayPal Fee Optimizer', icon: Calculator },
     { id: 'scam-shield', label: 'Payment Scam Shield', icon: ShieldAlert, badge: 'AI Guard' },
     { id: 'account-health', label: 'Seller Account Health', icon: Activity },
     { id: 'ai-assistant', label: 'PayPal Financial AI', icon: Bot, badge: 'Assistant' },
-    { id: 'settings', label: 'Sandbox API Settings', icon: Settings },
+    { id: 'settings', label: 'Account & API Settings', icon: Settings },
   ];
 
   return (
@@ -107,10 +109,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   onSelectTab(item.id);
                   onCloseMobile();
                 }}
-                className={`w-full group flex items-center justify-between px-3 py-2.5 rounded-xl text-xs font-medium transition-all duration-150 ${
+                className={`w-full group btn-press flex items-center justify-between px-3.5 py-2.5 rounded-full text-xs font-medium transition-all duration-150 ${
                   isActive
-                    ? 'bg-[#0070BA] text-white shadow-sm shadow-[#0070BA]/30 font-semibold'
-                    : 'text-slate-600 dark:text-[#9BB0D6] hover:text-[#003087] dark:hover:text-white hover:bg-slate-100/80 dark:hover:bg-[#0B1A3A]/70'
+                    ? 'bg-[#003087] dark:bg-[#0070BA] text-white shadow-sm shadow-[#003087]/25 font-semibold'
+                    : 'text-[#001435]/75 dark:text-[#9BB0D6] hover:text-[#003087] dark:hover:text-white hover:bg-[#F5F7FA] dark:hover:bg-[#0B1A3A]/70'
                 }`}
               >
                 <div className="flex items-center gap-2.5">

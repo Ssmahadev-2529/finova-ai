@@ -9,7 +9,8 @@ import {
   TrendsResponse,
   PatternAnalyticsResponse,
   AiInsightCard,
-  User
+  User,
+  SystemHealthResponse
 } from './types';
 import {
   INITIAL_TRANSACTIONS,
@@ -20,6 +21,7 @@ import { Sidebar } from './components/layout/Sidebar';
 import { Header } from './components/layout/Header';
 import { DashboardView } from './views/DashboardView';
 import { TransactionsView } from './views/TransactionsView';
+import { BudgetsView } from './views/BudgetsView';
 import { CostOptimizerView } from './views/CostOptimizerView';
 import { ScamShieldView } from './views/ScamShieldView';
 import { AccountHealthView } from './views/AccountHealthView';
@@ -27,18 +29,23 @@ import { AiAssistantView } from './views/AiAssistantView';
 import { SettingsView } from './views/SettingsView';
 import { SimulatePaymentModal } from './components/common/SimulatePaymentModal';
 import { AuthModal } from './components/common/AuthModal';
-import { CheckCircle2 } from 'lucide-react';
+import { CheckCircle2, AlertTriangle } from 'lucide-react';
 import { api, authStorage } from './services/api';
 
 export const App: React.FC = () => {
   const [currentTab, setCurrentTab] = useState<NavigationTab>('dashboard');
   const [isMobileOpen, setIsMobileOpen] = useState<boolean>(false);
-  const [transactions, setTransactions] = useState<Transaction[]>(INITIAL_TRANSACTIONS);
+  const [transactions, setTransactions] = useState<Transaction[]>(() =>
+    authStorage.getToken() ? [] : INITIAL_TRANSACTIONS
+  );
   const [healthMetrics, setHealthMetrics] = useState<AccountHealthMetrics>(MOCK_ACCOUNT_HEALTH);
   const [settings, setSettings] = useState<MerchantSettings>(INITIAL_SETTINGS);
   const [selectedTransaction, setSelectedTransaction] = useState<Transaction | null>(null);
   const [activeDataSourceFilter, setActiveDataSourceFilter] = useState<'all' | DataSourceType>('all');
   const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
+  const [isLoadingData, setIsLoadingData] = useState<boolean>(false);
+  const [dataError, setDataError] = useState<string | null>(null);
+  const [systemHealth, setSystemHealth] = useState<SystemHealthResponse | null>(null);
   const [isSimulateModalOpen, setIsSimulateModalOpen] = useState<boolean>(false);
   const [isAuthModalOpen, setIsAuthModalOpen] = useState<boolean>(false);
   const [pendingResetToken, setPendingResetToken] = useState<string | null>(null);
@@ -82,6 +89,7 @@ export const App: React.FC = () => {
 
   // Load backend intelligence data
   const fetchAnalyticsData = useCallback(async (period: 'daily' | 'weekly' | 'monthly' = selectedPeriod) => {
+    if (!authStorage.getToken()) return;
     try {
       const summary = await api.getAnalyticsSummary();
       if (summary) setAnalyticsSummary(summary);
@@ -109,28 +117,38 @@ export const App: React.FC = () => {
     } catch (err) {
       console.warn('AI insights unavailable:', err);
     }
-  }, [selectedPeriod]);
+  }, []);
 
-  // Load backend data on startup only when a session token is present
+  // Load backend system health & authenticated merchant data on startup
   useEffect(() => {
+    api.getSystemHealth().then(setSystemHealth).catch(() => setSystemHealth(null));
+
     const fetchBackendData = async () => {
-      if (!authStorage.getToken()) {
+      const startupToken = authStorage.getToken();
+      if (!startupToken) {
         return;
       }
 
+      setIsLoadingData(true);
+      setDataError(null);
       const user = await api.getCurrentUser();
       if (!user) {
+        setIsLoadingData(false);
+        // Only restore demo dataset if no newer authenticated session was established while /auth/me was in flight
+        if (!authStorage.getToken() || authStorage.getToken() === startupToken) {
+          setTransactions(INITIAL_TRANSACTIONS);
+        }
         return;
       }
       setCurrentUser(user);
 
       try {
         const txns = await api.getTransactions();
-        if (txns && txns.length > 0) {
-          setTransactions(txns);
-        }
-      } catch {
-        console.warn('Backend unavailable, using initial dataset.');
+        // Always reflect authoritative backend ledger even when empty (0 records)
+        setTransactions(Array.isArray(txns) ? txns : []);
+      } catch (err: any) {
+        setDataError(err?.message || 'Unable to synchronize live merchant ledger.');
+        setTransactions([]);
       }
 
       try {
@@ -139,10 +157,11 @@ export const App: React.FC = () => {
           setHealthMetrics(health);
         }
       } catch {
-        // use default metrics
+        // surfaced via dataError if primary ledger also fails
       }
 
       await fetchAnalyticsData('daily');
+      setIsLoadingData(false);
     };
 
     fetchBackendData();
@@ -159,6 +178,7 @@ export const App: React.FC = () => {
       setTrendsData(null);
       setPatternsData(null);
       setAiInsights(null);
+      setDataError(null);
       showToast('Session expired or invalidated. Please sign in to access live merchant data.');
       setIsAuthModalOpen(true);
     };
@@ -196,24 +216,36 @@ export const App: React.FC = () => {
     setTransactions((prev) => [newTxn, ...prev.filter(t => t.id !== newTxn.id)]);
     showToast(`Payment ${newTxn.id} ($${newTxn.amount.toFixed(2)}) captured and recorded in ledger!`);
     await fetchAnalyticsData(selectedPeriod);
+    try {
+      const health = await api.getHealthMetrics();
+      if (health) setHealthMetrics(health);
+    } catch {
+      // non-fatal
+    }
   };
 
   // Handler for refreshing data
   const handleRefreshData = async () => {
     setIsRefreshing(true);
+    setDataError(null);
+    api.getSystemHealth().then(setSystemHealth).catch(() => setSystemHealth(null));
+    if (!authStorage.getToken()) {
+      setIsRefreshing(false);
+      showToast('Demo preview active. Sign in to sync live database records.');
+      return;
+    }
     try {
       const txns = await api.getTransactions();
-      if (txns && txns.length > 0) {
-        setTransactions(txns);
-      }
+      setTransactions(Array.isArray(txns) ? txns : []);
       const health = await api.getHealthMetrics();
       if (health) {
         setHealthMetrics(health);
       }
       await fetchAnalyticsData(selectedPeriod);
       showToast('Live PayPal Sandbox transactions & intelligence synchronized with database.');
-    } catch {
-      showToast('Transactions synchronized (local mode).');
+    } catch (err: any) {
+      setDataError(err?.message || 'Failed to synchronize backend data.');
+      showToast('Backend synchronization failed. Check API health status.');
     } finally {
       setIsRefreshing(false);
     }
@@ -221,16 +253,20 @@ export const App: React.FC = () => {
 
   // Handler for resetting demo data
   const handleResetDemoData = () => {
+    if (currentUser) {
+      handleRefreshData();
+      return;
+    }
     setTransactions(INITIAL_TRANSACTIONS);
     setHealthMetrics(MOCK_ACCOUNT_HEALTH);
     showToast('Synthetic demonstration dataset reset to default state.');
   };
 
   return (
-    <div className="min-h-screen bg-[#F8FAFC] dark:bg-[#030816] fintech-ambient-bg text-slate-800 dark:text-slate-100 flex transition-colors duration-200">
+    <div className="min-h-screen overflow-x-hidden bg-[#F5F7FA] dark:bg-[#030816] fintech-ambient-bg text-[#001435] dark:text-slate-100 flex transition-colors duration-200">
       {/* Toast Notification */}
       {toastMessage && (
-        <div className="fixed bottom-5 right-5 z-50 px-4 py-2.5 rounded-2xl glass-surface text-[#003087] dark:text-[#38BDF8] text-xs font-semibold shadow-xl flex items-center gap-2 animate-in fade-in slide-in-from-bottom-2">
+        <div role="status" className="fixed bottom-5 right-5 z-50 px-4 py-2.5 rounded-2xl glass-surface text-[#003087] dark:text-[#38BDF8] text-xs font-semibold shadow-xl flex items-center gap-2 animate-in fade-in slide-in-from-bottom-2">
           <CheckCircle2 className="w-4 h-4 text-[#0070BA] dark:text-[#38BDF8]" />
           <span>{toastMessage}</span>
         </div>
@@ -258,10 +294,40 @@ export const App: React.FC = () => {
           onToggleTheme={toggleTheme}
           currentUser={currentUser}
           onOpenAuth={() => setIsAuthModalOpen(true)}
+          systemHealth={systemHealth}
         />
 
         {/* Content View Container */}
         <main className="flex-1 p-4 sm:p-6 lg:p-8 max-w-7xl w-full mx-auto">
+          {dataError && (
+            <div role="alert" className="mb-4 p-3.5 rounded-xl bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 text-xs text-rose-700 dark:text-rose-200 flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 shrink-0" />
+                <span>{dataError}</span>
+              </div>
+              <button
+                onClick={handleRefreshData}
+                className="px-3 py-1 rounded-full bg-rose-600 text-white text-[11px] font-bold shrink-0"
+              >
+                Retry Sync
+              </button>
+            </div>
+          )}
+
+          {!currentUser && (
+            <div className="mb-4 p-3 rounded-xl bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/60 text-xs text-amber-900 dark:text-amber-200 flex items-center justify-between gap-3">
+              <span>
+                <strong>Demo Preview Mode:</strong> Showing sample dataset. Sign in or register to create transactions, manage budgets, issue PayPal Sandbox orders/refunds, or run tenant-scoped AI audits.
+              </span>
+              <button
+                onClick={() => setIsAuthModalOpen(true)}
+                className="px-3.5 py-1.5 rounded-full bg-[#0070BA] text-white text-[11px] font-bold shrink-0 hover:bg-[#005EA6]"
+              >
+                Sign In
+              </button>
+            </div>
+          )}
+
           {currentTab === 'dashboard' && (
             <DashboardView
               key={`dash-${currentUser?.id ?? 'anon'}`}
@@ -278,6 +344,9 @@ export const App: React.FC = () => {
               aiInsights={aiInsights}
               selectedPeriod={selectedPeriod}
               onChangePeriod={handlePeriodChange}
+              isLoading={isLoadingData}
+              isAuthenticated={Boolean(currentUser)}
+              onOpenAuth={() => setIsAuthModalOpen(true)}
             />
           )}
 
@@ -288,6 +357,17 @@ export const App: React.FC = () => {
               selectedTransaction={selectedTransaction}
               onSelectTransaction={(txn) => setSelectedTransaction(txn)}
               onSimulateNewPayment={() => setIsSimulateModalOpen(true)}
+              onTransactionsChanged={handleRefreshData}
+              isAuthenticated={Boolean(currentUser)}
+              onNotify={showToast}
+            />
+          )}
+
+          {currentTab === 'budgets' && (
+            <BudgetsView
+              key={`budgets-${currentUser?.id ?? 'anon'}`}
+              onOpenAuth={() => setIsAuthModalOpen(true)}
+              onDataUpdated={handleRefreshData}
             />
           )}
 
@@ -315,11 +395,22 @@ export const App: React.FC = () => {
           {currentTab === 'settings' && (
             <SettingsView
               settings={settings}
+              currentUser={currentUser}
+              systemHealth={systemHealth}
+              onUserUpdated={(u) => {
+                setCurrentUser(u);
+                if (!u) {
+                  setTransactions(INITIAL_TRANSACTIONS);
+                  setAnalyticsSummary(null);
+                }
+              }}
+              onOpenAuth={() => setIsAuthModalOpen(true)}
               onUpdateSettings={(newSettings) => {
                 setSettings(newSettings);
                 showToast('Settings saved successfully.');
               }}
               onResetDemoData={handleResetDemoData}
+              onNotify={showToast}
             />
           )}
         </main>

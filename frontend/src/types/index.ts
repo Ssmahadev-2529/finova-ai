@@ -1,6 +1,7 @@
 export type NavigationTab = 
   | 'dashboard' 
   | 'transactions' 
+  | 'budgets'
   | 'cost-optimizer' 
   | 'scam-shield' 
   | 'account-health' 
@@ -9,7 +10,7 @@ export type NavigationTab =
 
 export type DataSourceType = 'sandbox' | 'synthetic';
 
-export type TransactionStatus = 'COMPLETED' | 'PENDING' | 'REFUNDED' | 'DENIED' | 'DISPUTED';
+export type TransactionStatus = 'COMPLETED' | 'PENDING' | 'REFUNDED' | 'DENIED' | 'DISPUTED' | 'REFUNDING' | 'REFUND_UNKNOWN';
 
 export type RiskLevel = 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
 
@@ -18,6 +19,7 @@ export type PaymentMethod = 'PayPal Wallet' | 'Credit/Debit Card' | 'Venmo' | 'P
 export interface Transaction {
   id: string;
   paypalOrderId?: string;
+  paypalCaptureId?: string;
   customerName: string;
   customerEmail: string;
   amount: number;
@@ -34,6 +36,10 @@ export interface Transaction {
   isAnomaly: boolean;
   anomalyReason?: string;
   dataSource: DataSourceType;
+  category?: string;
+  txnType?: 'income' | 'expense';
+  notes?: string;
+  updatedAt?: string;
 }
 
 export interface ScamAnalysisResult {
@@ -266,6 +272,8 @@ export interface FinancialSummaryCard {
 export interface AssistantChatResponse {
   reply: string;
   category: string;
+  groundingSource?: string;
+  retrievedSources?: string[];
   financialCard?: FinancialSummaryCard;
   suggestedFollowUps?: string[];
   context: {
@@ -316,11 +324,20 @@ export interface AnalyticsSummary {
   grossPaymentVolume: number;
   completedVolume: number;
   totalNetReceived: number;
+  totalIncome?: number;
+  totalExpenses?: number;
+  netCashFlow?: number;
   totalFees: number;
   totalActualFees: number;
   totalEstimatedFees: number;
   confirmedFeeCoveragePct: number;
   averageTicketSize: number;
+  categoryBreakdown?: Array<{
+    category: string;
+    count: number;
+    incomeVolume: number;
+    expenseVolume: number;
+  }>;
   statusBreakdown: Record<string, StatusMetric>;
   sourceBreakdown: {
     sandbox: { count: number; volume: number };
@@ -694,4 +711,92 @@ export interface SecurityAuditLog {
   status: 'SUCCESS' | 'FAILURE' | 'BLOCKED' | 'NOTICE';
   details: Record<string, any>;
   timestamp: string;
+}
+
+export interface PagedTransactionsResponse {
+  items: Transaction[];
+  total: number;
+  page: number;
+  pageSize: number;
+  totalPages: number;
+}
+
+export interface ManualTransactionPayload {
+  customerName: string;
+  customerEmail?: string;
+  amount: number;
+  currency?: string;
+  status?: TransactionStatus;
+  paymentMethod?: string;
+  country?: string;
+  category?: string;
+  txnType?: 'income' | 'expense';
+  date?: string;
+  notes?: string;
+}
+
+export interface UpdateTransactionPayload {
+  customerName?: string;
+  amount?: number;
+  currency?: string;
+  status?: TransactionStatus;
+  category?: string;
+  txnType?: 'income' | 'expense';
+  notes?: string;
+}
+
+export interface FinancialCategory {
+  id: string;
+  userId: string;
+  name: string;
+  kind: 'income' | 'expense' | 'both';
+  color: string;
+  createdAt?: string;
+}
+
+export interface FinancialBudget {
+  id: string;
+  userId: string;
+  category: string;
+  limitAmount: number;
+  currency: string;
+  period: 'weekly' | 'monthly' | 'quarterly';
+  alertThresholdPct: number;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface BudgetUtilizationItem extends FinancialBudget {
+  spentAmount: number;
+  remainingAmount: number;
+  utilizationPct: number;
+  status: 'ON_TRACK' | 'WARNING' | 'EXCEEDED';
+}
+
+export interface BudgetUtilizationResponse {
+  budgets: BudgetUtilizationItem[];
+  totalBudgets: number;
+}
+
+export interface AiUsageSummary {
+  totalQueries: number;
+  geminiQueries: number;
+  deterministicQueries: number;
+  fallbackCount: number;
+  averageLatencyMs: number;
+  recentLogs: Array<{
+    id: string;
+    intent: string;
+    provider: string;
+    usedFallback: boolean;
+    latencyMs: number;
+    createdAt: string;
+  }>;
+}
+
+export interface SystemHealthResponse {
+  status: string;
+  service?: string;
+  database?: string;
+  redis?: string;
 }
